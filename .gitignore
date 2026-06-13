@@ -1,0 +1,141 @@
+# ==================== Python ====================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+pc_host/.venv/
+venv/
+.venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ==================== Keil MDK ====================
+# Keil project output files
+*.bak
+*.dep
+*.JLinkLog.txt
+*.uvgui.*
+*.Administrator
+*.plg
+*.Administrator.old
+*.crf
+*.d
+*.o
+*.axf
+*.elf
+*.hex
+*.bin
+*.htm
+*.lnp
+*.map
+*.lst
+*.iex
+*.sbr
+*.tra
+*.scvd
+*.dbgconf
+*.FCM
+*.FSC
+*.FSC.orig
+
+# Keil project listings and objects
+Listings/
+Objects/
+RTE/
+*.build_log.htm
+Debug/
+*.pbi
+*.xcl
+*.pbd
+*.pbw
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Debug configurations
+*.uvoptx
+*.uvguix.*
+JLink.log
+JLinkSettings.ini
+
+# Keil IDE backup files
+*.uvproj.bak
+*.uvopt
+
+# ==================== General ====================
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+
+# ==================== Project Specific ====================
+# Any generated binaries or hex files
+*.bin
+*.hex
