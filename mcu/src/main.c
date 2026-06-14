@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
-#include <ctype.h>
+#include <stdlib.h>
 #include "hw_memmap.h"
 #include "debug.h"
 #include "gpio.h"
@@ -52,7 +52,39 @@
 #define MY_STUDENT_ID 			"31910229"
 #define MY_CLASS_ID				"AU2421  "
 #define MY_NAME					"GAOJX   "
-#define FW_VERSION				"V1.0.0  "	
+#define FW_VERSION				"V1.0.0  "
+
+/* =================== 串口通信协议相关定义 ====================== */
+#define PROTO_MAX_FRAME_LEN     64
+#define PROTO_ARG_MAX            6
+#define PROTO_MSG_MAX_LEN       32
+
+#define OK_STR					"OK"
+#define ERROR_SYNTAX_STR		"ERROR SYNTAX"
+#define ERROR_PARAM_STR			"ERROR PARAM"
+#define ERROR_RANGE_STR			"ERROR RANGE"
+#define ERROR_LEN_STR			"ERROR LEN"
+#define ERROR_BUSY_STR			"ERROR BUSY"
+
+/* ---------- 滚动方向 ---------- */
+typedef enum {
+    FORMAT_LEFT = 0,
+    FORMAT_RIGHT
+} FORMAT_DIR;
+FORMAT_DIR display_format = FORMAT_LEFT;     // 默认左向
+
+bool display_on = true;                       // 数码管亮灭
+char user_msg[PROTO_MSG_MAX_LEN + 1] = {0};   // 用户自定义滚动消息
+volatile uint8_t user_msg_active = 0;          // 是否有滚动消息
+
+/* MSG文本的当前起始显示位置(用于滚动), 负数表示不滚动 */
+volatile int16_t msg_scroll_offset = 0;
+volatile uint32_t last_msg_scroll_tick = 0;
+volatile uint8_t scroll_speed = 500;       // 滚动速度 (ms), 默认500ms
+
+/* 远程蜂鸣时长 */
+volatile uint32_t remote_beep_ms = 0;
+volatile uint32_t remote_beep_start_tick = 0;	
 
 
 /* =========================================================================== */
@@ -92,7 +124,7 @@ void Buzzer_Toggle(void);
 
 /* =================== UART ====================== */
 #define UART_BUFFER_SIZE 128
-char str[UART_BUFFER_SIZE];
+
 char TxBuf[UART_BUFFER_SIZE];
 volatile char RxBuf[UART_BUFFER_SIZE];
 // volatile uint32_t RxBufIndex = 0;
@@ -101,6 +133,42 @@ volatile uint8_t RxEndFlag = 0;
 void S800_UART_Init(void);
 void UARTStringPut(const char *cMessage);
 void UARTStringPutNonBlocking(const unsigned char *msg);
+
+/* =================== 协议处理函数 ====================== */
+
+// ---- 辅助工具 ----
+#define toupper(c) (((c) >= 'a' && (c) <= 'z') ? ((c) - 0x20) : (c))
+
+void str_toupper(char *s);
+void str_reverse(char *dst, const char *src, int len);
+void format_reverse(char *buf, const char *val);
+void respond(const char *resp);
+void respond_error(const char *err);
+void respond_ok_data(const char *data);
+void respond_ok(void);
+
+// ---- 缩写匹配 ----
+bool match_abbr(const char *input, const char *pattern);
+
+// ---- 帧解析 ----
+bool parse_frame(const char *raw, char *cmd, int cmd_size,
+                 char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int *argc);
+
+// ---- 命令处理 ----
+void process_command(const char *raw);
+void cmd_RST(void);
+void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc);
+void cmd_GET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc);
+void cmd_PING(void);
+
+// ---- 主动上报 ----
+void evt_send_edit(const char *type, const char *value);
+void evt_send_disp(void);
+void evt_send_led(void);
+void evt_send_key(const char *name);
+void evt_send_alarm(void);
+void evt_send_alarm_off(void);
+void evt_send_mode(const char *state);
 
 
 /* ===================== I2C ========================= */
@@ -158,8 +226,23 @@ const uint8_t seg7_letter[] = {
 	0x6a, // W
 	0x36, // X
 	0x6e, // Y
-	0x49  // Z
+		0x49  // Z
 };
+
+static char seg7_glyph_to_char(uint8_t glyph) {
+	int i;
+    // 先在数字表里找
+    for (i = 0; i < 16; i++) {
+        if (seg7_digit[i] == glyph)
+            return (i < 10) ? ('0' + i) : ('A' + (i - 10));
+    }
+    // 再在字母表里找
+    for (i = 0; i < 26; i++) {
+        if (seg7_letter[i] == glyph)
+            return 'A' + i;
+    }
+    return '_';
+}
 
 uint8_t seg_display_buffer[DISP_LEN] = {0};	// 数码管显示内容缓存
 static uint8_t seg_display_pos = 0;
@@ -172,11 +255,11 @@ void seg_refresh(void);
 void boot_display(void);
 
 uint8_t scroll_str[64] = {0};
-typedef enum{
-	SCROLL_IDLE = 0,
-	SCROLL_LEFT, 
-	SCROLL_RIGHT
-} SCROLL_DIR;
+// typedef enum{
+// 	SCROLL_IDLE = 0,
+// 	SCROLL_LEFT, 
+// 	SCROLL_RIGHT
+// } SCROLL_DIR;
 
 /* ================= 电子时钟 ================ */
 
@@ -218,7 +301,8 @@ bool add_month(date_t *date);
 bool add_year(date_t *date);
 
 void show_time(void);
-void show_date(void);
+void show_date_1(void);
+void show_date_2(void);
 
 time_t alarm_time = {19, 0, 5};
 volatile uint8_t alarming = 0;
@@ -320,7 +404,7 @@ typedef enum{
 	MODE_SHOW_DATE_2,
 	MODE_SETTING
 } SYSTEM_MODE;		// 系统显示模式
-SYSTEM_MODE system_mode = MODE_BOOT;
+SYSTEM_MODE system_mode = MODE_SHOW_TIME;
 SYSTEM_MODE temp_mode = MODE_BOOT;		// 用于进入设置项后，保存进入前的模式
 
 typedef enum{
@@ -386,6 +470,615 @@ void UARTStringPutNonBlocking(const unsigned char *msg)
 		if (UARTSpaceAvail(UART0_BASE)) //发送FIFO有空位
 			UARTCharPutNonBlocking(UART0_BASE, *msg++); //发送一个字符
 	}
+}
+
+/* ========================= 协议工具函数 ================================== */
+
+void str_toupper(char *s)
+{
+    while (*s) {
+        *s = (char)toupper((unsigned char)*s);
+        s++;
+    }
+}
+
+void str_reverse(char *dst, const char *src, int len)
+{
+    int i;
+    for (i = 0; i < len; i++) {
+        dst[i] = src[len - 1 - i];
+    }
+    dst[len] = '\0';
+}
+
+void format_reverse(char *buf, const char *val)
+{
+    int len = (int)strlen(val);
+    int i, j = 0;
+    char tmp[PROTO_MAX_FRAME_LEN];
+    for (i = 0; i < len; i++) {
+        tmp[i] = val[len - 1 - i];
+    }
+    tmp[len] = '\0';
+
+    for (i = 0; i < len; i++) {
+        buf[j++] = tmp[i];
+    }
+    buf[j] = '\0';
+}
+
+void respond(const char *resp)
+{
+    UARTStringPutNonBlocking((const unsigned char *)resp);
+    UARTStringPutNonBlocking((const unsigned char *)"\r\n");
+}
+
+void respond_error(const char *err)
+{
+    respond(err);
+}
+
+void respond_ok_data(const char *data)
+{
+    char buf[PROTO_MAX_FRAME_LEN];
+    sprintf(buf, "%s %s", OK_STR, data);
+    respond(buf);
+}
+
+void respond_ok(void)
+{
+    respond(OK_STR);
+}
+
+// ---- 大小写无关的缩写匹配 ----
+bool match_abbr(const char *input, const char *pattern)
+{
+    int i = 0, j = 0;
+    while (input[i] != '\0' && pattern[j] != '\0') {
+        if (toupper((unsigned char)input[i]) != toupper((unsigned char)pattern[j])) {
+            return false;
+        }
+        i++;
+        j++;
+    }
+    if (input[i] != '\0') {
+        return false;
+    }
+    while (pattern[j] != '\0') {
+        if (pattern[j] >= 'A' && pattern[j] <= 'Z') {
+            return false;
+        }
+        j++;
+    }
+    return true;
+}
+
+// ---- 帧解析 ----
+bool parse_frame(const char *raw, char *cmd, int cmd_size,
+                 char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int *argc)
+{
+    static char tmp[PROTO_MAX_FRAME_LEN + 1];
+    char *token;
+    int i;
+
+	memset(tmp, 0, sizeof(tmp));
+    cmd[0] = '\0';
+    *argc = 0;
+
+    if (strlen(raw) > PROTO_MAX_FRAME_LEN) {
+        respond_error(ERROR_LEN_STR);
+        return false;
+    }
+
+    strncpy(tmp, raw, PROTO_MAX_FRAME_LEN);
+    tmp[PROTO_MAX_FRAME_LEN] = '\0';
+
+    token = strtok(tmp, " :\t");
+    if (token == NULL) {
+        return false;
+    }
+
+    strncpy(cmd, token, cmd_size - 1);
+    cmd[cmd_size - 1] = '\0';
+
+    while ((token = strtok(NULL, " \t")) != NULL) {
+        if (*argc >= PROTO_ARG_MAX) {
+            respond_error(ERROR_SYNTAX_STR);
+            return false;
+        }
+        strncpy(args[*argc], token, (PROTO_MAX_FRAME_LEN/2) - 1);
+        args[*argc][PROTO_MAX_FRAME_LEN/2 - 1] = '\0';
+        (*argc)++;
+    }
+
+    return true;
+}
+
+// ---- 命令处理主入口 ----
+void process_command(const char *raw)
+{
+    static char cmd[PROTO_MAX_FRAME_LEN];
+    static char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2];
+    int argc = 0;
+
+    memset(cmd, 0, sizeof(cmd));
+    memset(args, 0, sizeof(args));
+
+    if (!parse_frame(raw, cmd, sizeof(cmd), args, &argc)) {
+        return;
+    }
+
+    if (cmd[0] != '*') {
+        respond_error(ERROR_SYNTAX_STR);
+        return;
+    }
+
+    if (match_abbr(cmd, "*RST")) {
+        cmd_RST();
+    } else if (match_abbr(cmd, "*SET")) {
+        cmd_SET(args, argc);
+    } else if (match_abbr(cmd, "*GET")) {
+        cmd_GET(args, argc);
+    } else if (match_abbr(cmd, "*PING")) {
+        cmd_PING();
+    } else {
+        respond_error(ERROR_SYNTAX_STR);
+    }
+}
+
+// ---- *RST 实现 ----
+void cmd_RST(void)
+{
+    system_date.year = 2026;
+    system_date.month = 6;
+    system_date.day = 1;
+    system_time.hour = 12;
+    system_time.min = 0;
+    system_time.sec = 0;
+    display_on = true;
+    display_format = FORMAT_LEFT;
+	user_msg_active = 0;
+    memset(user_msg, 0, sizeof(user_msg));
+    msg_scroll_offset = 0;
+    scroll_speed = 500;
+	remote_beep_ms = 0;
+
+    if (system_mode == MODE_SETTING) {
+        system_mode = MODE_SHOW_TIME;
+    }
+
+    show_time();
+    respond_ok();
+}
+
+// ---- *SET 实现 ----
+void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
+{
+    char type_str[PROTO_MAX_FRAME_LEN/2] = {0};
+    int i = 0;
+
+    if (argc < 1) {
+        respond_error(ERROR_SYNTAX_STR);
+        return;
+    }
+
+    strncpy(type_str, args[0], sizeof(type_str) - 1);
+    str_toupper(type_str);
+
+    // ---- *SET:DATE ----
+    if (match_abbr(type_str, "DATE")) {
+		int v;
+        int idx = 1;
+		date_t new_date = system_date;
+
+        while (idx < argc) {
+            char kw[PROTO_MAX_FRAME_LEN/2] = {0};
+            strncpy(kw, args[idx], sizeof(kw) - 1);
+            kw[sizeof(kw) - 1] = '\0';
+            str_toupper(kw);
+
+            if (match_abbr(kw, "YEAR")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 1960 || v > 2099) { respond_error(ERROR_RANGE_STR); return; }
+                                new_date.year = (uint16_t)v;
+            } else if (match_abbr(kw, "MONTH")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 1 || v > 12) { respond_error(ERROR_RANGE_STR); return; }
+                                new_date.month = (uint8_t)v;
+            } else if (match_abbr(kw, "DATE")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 1 || v > 31) { respond_error(ERROR_RANGE_STR); return; }
+                                new_date.day = (uint8_t)v;
+            } else {
+                respond_error(ERROR_SYNTAX_STR);
+                return;
+            }
+            idx++;
+        }
+
+        if (!is_valid_date(new_date)) {
+            respond_error(ERROR_RANGE_STR);
+            return;
+        }
+
+		system_date = new_date;
+        respond_ok();
+        {
+            static char buf[16];
+            sprintf(buf, "%04d.%02d.%02d", system_date.year, system_date.month, system_date.day);
+            evt_send_edit("DATE", buf);
+        }
+        if (system_mode == MODE_SHOW_TIME) {
+            show_time();
+        } else if (system_mode == MODE_SHOW_DATE_1 || system_mode == MODE_SHOW_DATE_2) {
+            show_date_1();
+        }
+        return;
+    }
+
+    // ---- *SET:TIME ----
+    if (match_abbr(type_str, "TIME")) {
+		int v;
+        int idx = 1;
+        time_t new_time = system_time;
+
+        while (idx < argc) {
+            char kw[PROTO_MAX_FRAME_LEN/2];
+            strncpy(kw, args[idx], sizeof(kw) - 1);
+            kw[sizeof(kw) - 1] = '\0';
+            str_toupper(kw);
+
+            if (match_abbr(kw, "HOUR")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 0 || v > 23) { respond_error(ERROR_RANGE_STR); return; }
+                new_time.hour = (uint8_t)v;
+            } else if (match_abbr(kw, "MIN")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
+                new_time.min = (uint8_t)v;
+            } else if (match_abbr(kw, "SEC")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
+                new_time.sec = (uint8_t)v;
+            } else {
+                respond_error(ERROR_SYNTAX_STR);
+                return;
+            }
+            idx++;
+        }
+
+        if (!is_valid_time(new_time)) {
+            respond_error(ERROR_RANGE_STR);
+            return;
+        }
+
+		system_time = new_time;
+        respond_ok();
+        {
+            static char buf[16];
+            sprintf(buf, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
+            evt_send_edit("TIME", buf);
+        }
+        if (system_mode == MODE_SHOW_TIME) {
+            show_time();
+        }
+        return;
+    }
+
+    // ---- *SET:ALARM ----
+    if (match_abbr(type_str, "ALARM")) {
+		int v;
+        int idx = 1;
+                time_t new_alarm = alarm_time;
+
+        while (idx < argc) {
+            char kw[PROTO_MAX_FRAME_LEN/2];
+            strncpy(kw, args[idx], sizeof(kw) - 1);
+            kw[sizeof(kw) - 1] = '\0';
+            str_toupper(kw);
+
+            if (match_abbr(kw, "OFF")) {
+                alarming = 0;
+                Buzzer_Off();
+				idx++;
+            } else if (match_abbr(kw, "HOUR")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 0 || v > 23) { respond_error(ERROR_RANGE_STR); return; }
+                new_alarm.hour = (uint8_t)v;
+                idx++;
+            } else if (match_abbr(kw, "MIN")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
+                new_alarm.min = (uint8_t)v;
+                idx++;
+            } else if (match_abbr(kw, "SEC")) {
+                idx++;
+                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
+                v = (int)strtol(args[idx], NULL, 10);
+                if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
+                new_alarm.sec = (uint8_t)v;
+                idx++;
+            } else {
+                respond_error(ERROR_SYNTAX_STR);
+                return;
+            }
+        }
+
+        alarm_time = new_alarm;
+        respond_ok();
+        return;
+    }
+
+    // ---- *SET:DISPlay ----
+    if (match_abbr(type_str, "DISP")) {
+		char val[PROTO_MAX_FRAME_LEN/2];
+        if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
+        strncpy(val, args[1], sizeof(val) - 1);
+        val[sizeof(val) - 1] = '\0';
+        str_toupper(val);
+        if (strcmp(val, "ON") == 0) {
+            display_on = true;
+            respond_ok();
+        } else if (strcmp(val, "OFF") == 0) {
+            display_on = false;
+            seg_clear();
+            led_on(0x00);
+            respond_ok();
+        } else {
+            respond_error(ERROR_PARAM_STR);
+        }
+        return;
+    }
+
+    // ---- *SET:FORMAT ----
+    if (match_abbr(type_str, "FORMAT")) {
+		char val[PROTO_MAX_FRAME_LEN/2];
+        if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }        
+        strncpy(val, args[1], sizeof(val) - 1);
+        val[sizeof(val) - 1] = '\0';
+        str_toupper(val);
+        if (strcmp(val, "LEFT") == 0) {
+            display_format = FORMAT_LEFT;
+            respond_ok();
+        } else if (strcmp(val, "RIGHT") == 0) {
+            display_format = FORMAT_RIGHT;
+            respond_ok();
+        } else {
+            respond_error(ERROR_PARAM_STR);
+        }
+        return;
+    }
+
+    // ---- *SET:MSG ----
+    if (match_abbr(type_str, "MSG")) {
+		int total_len = 0;
+        if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
+        for (i = 1; i < argc; i++) {
+            total_len += (int)strlen(args[i]) + 1;
+        }
+        if (total_len > PROTO_MSG_MAX_LEN + 1) {
+            respond_error(ERROR_LEN_STR);
+            return;
+        }
+		memset(user_msg, 0, sizeof(user_msg));
+        for (i = 1; i < argc; i++) {
+            if (i > 1) strcat(user_msg, " ");
+            strcat(user_msg, args[i]);
+        }
+        user_msg_active = 1;
+        msg_scroll_offset = 0;
+        last_msg_scroll_tick = systick_count;
+
+        /* ≤8位静态显示; >8位进入滚动 */
+        if ((int)strlen(user_msg) > DISP_LEN) {
+            seg_set_display(user_msg);
+        } else {
+            seg_set_display(user_msg);
+        }
+        respond_ok();
+        return;
+    }
+
+    // ---- *SET:BEEP ----
+    if (match_abbr(type_str, "BEEP")) {
+		int ms = (int)strtol(args[1], NULL, 10);
+        if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
+        if (ms < 10 || ms > 5000) {
+            respond_error(ERROR_RANGE_STR);
+            return;
+        }
+        remote_beep_ms = (uint32_t)ms;
+        remote_beep_start_tick = systick_count;
+        Buzzer_On();
+        respond_ok();
+        return;
+    }
+
+    // ---- *SET:LED ----
+    if (match_abbr(type_str, "LED")) {
+		uint8_t val = (uint8_t)strtol(args[1], NULL, 16);
+        if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
+        led_on(val);
+        respond_ok();
+        return;
+    }
+
+    // ---- *SET:KEY ----
+    if (match_abbr(type_str, "KEY")) {
+		char kw[PROTO_MAX_FRAME_LEN/2] = {0};
+		KEY_EVENT ev;
+
+        if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
+        strncpy(kw, args[1], sizeof(kw) - 1);
+        kw[sizeof(kw) - 1] = '\0';
+        str_toupper(kw);
+
+        ev.state = KEY_TAP;
+        ev.source = OTHER;
+
+        if (strcmp(kw, "FUNC") == 0)        { ev.key = KEY_FUNC; }
+        else if (strcmp(kw, "SHIFT") == 0)  { ev.key = KEY_SHIFT; }
+        else if (strcmp(kw, "ADD") == 0)    { ev.key = KEY_ADD; }
+        else if (strcmp(kw, "SAVE") == 0)   { ev.key = KEY_SAVE; }
+        else if (strcmp(kw, "DISP") == 0)   { ev.key = KEY_DISP; }
+        else if (strcmp(kw, "SPEED") == 0)  { ev.key = KEY_SPEED; }
+        else if (strcmp(kw, "FORMAT") == 0) { ev.key = KEY_FORMAT; }
+        else if (strcmp(kw, "EXT") == 0)    { ev.key = KEY_EXT; }
+        else if (strcmp(kw, "USER1") == 0)  { ev.key = KEY_USER1; }
+        else if (strcmp(kw, "USER2") == 0)  { ev.key = KEY_USER2; }
+        else {
+            respond_error(ERROR_PARAM_STR);
+            return;
+        }
+
+        key_cb[(ev.key) - 1](ev);
+        respond_ok();
+        return;
+    }
+
+    // ---- *SET:MODE (扩展) ----
+    if (match_abbr(type_str, "MODE")) {
+		char val[PROTO_MAX_FRAME_LEN/2];
+        if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
+        
+        strncpy(val, args[1], sizeof(val) - 1);
+        val[sizeof(val) - 1] = '\0';
+        str_toupper(val);
+        if (strcmp(val, "DAY") == 0 || strcmp(val, "NIGHT") == 0) {
+            respond_ok();
+            evt_send_mode(val);
+        } else {
+            respond_error(ERROR_PARAM_STR);
+        }
+        return;
+    }
+
+    respond_error(ERROR_SYNTAX_STR);
+}
+
+// ---- *GET 实现 ----
+void cmd_GET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
+{
+    char type_str[PROTO_MAX_FRAME_LEN/2] = {0};
+    char data[PROTO_MAX_FRAME_LEN] = {0};
+
+    if (argc < 1) {
+        respond_error(ERROR_SYNTAX_STR);
+        return;
+    }
+
+    strncpy(type_str, args[0], sizeof(type_str) - 1);
+    str_toupper(type_str);
+
+    if (match_abbr(type_str, "DATE")) {
+        sprintf(data, "%04d.%02d.%02d", system_date.year, system_date.month, system_date.day);
+    } else if (match_abbr(type_str, "TIME")) {
+        sprintf(data, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
+    } else if (match_abbr(type_str, "ALARM")) {
+        sprintf(data, "%02d.%02d.%02d", alarm_time.hour, alarm_time.min, alarm_time.sec);
+    } else if (match_abbr(type_str, "DISP")) {
+        strcpy(data, display_on ? "ON" : "OFF");
+    } else if (match_abbr(type_str, "FORMAT")) {
+        strcpy(data, (display_format == FORMAT_LEFT) ? "LEFT" : "RIGHT");
+    } else {
+        respond_error(ERROR_SYNTAX_STR);
+        return;
+    }
+
+    if (display_format == FORMAT_RIGHT) {
+        char rev[PROTO_MAX_FRAME_LEN];
+        str_reverse(rev, data, (int)strlen(data));
+        respond_ok_data(rev);
+    } else {
+        respond_ok_data(data);
+    }
+}
+
+// ---- *PING 实现 ----
+void cmd_PING(void)
+{
+    char buf[PROTO_MAX_FRAME_LEN];
+    sprintf(buf, "*PONG %lu", systick_count / SYSTICK_FREQUENCY);
+    respond(buf);
+}
+
+// ---- 主动上报函数 ----
+void evt_send_edit(const char *type, const char *value)
+{
+    char buf[PROTO_MAX_FRAME_LEN];
+    sprintf(buf, "*EVT:EDIT %s %s", type, value);
+    respond(buf);
+}
+
+void evt_send_disp(void)
+{
+    char display_str[9];
+    uint8_t dp_bits = 0;
+    int i;
+	char buf[PROTO_MAX_FRAME_LEN];
+
+    for (i = 0; i < DISP_LEN; i++) {
+        uint8_t seg = seg_display_buffer[i];
+        bool is_dp = (seg & 0x80) ? true : false;
+        uint8_t glyph = seg & 0x7F;
+        display_str[i] = seg7_glyph_to_char(glyph);
+        if (is_dp) {
+            dp_bits |= (uint8_t)(1 << i);
+        }
+    }
+    display_str[DISP_LEN] = '\0';
+
+    sprintf(buf, "*EVT:DISP %s %02X", display_str, dp_bits);
+    respond(buf);
+}
+
+void evt_send_led(void)
+{
+    uint32_t val = I2C0_ReadByte(PCA9557_I2CADDR, PCA9557_INPUT);
+    uint8_t led_val = (uint8_t)((~val) & 0xFF);
+    char buf[PROTO_MAX_FRAME_LEN];
+    sprintf(buf, "*EVT:LED %02X", led_val);
+    respond(buf);
+}
+
+void evt_send_key(const char *name)
+{
+    char buf[PROTO_MAX_FRAME_LEN];
+    sprintf(buf, "*EVT:KEY %s", name);
+    respond(buf);
+}
+
+void evt_send_alarm(void)
+{
+    respond("*EVT:ALARM");
+}
+
+void evt_send_alarm_off(void)
+{
+    respond("*EVT:ALARM_OFF");
+}
+
+void evt_send_mode(const char *state)
+{
+    char buf[PROTO_MAX_FRAME_LEN];
+    sprintf(buf, "*EVT:MODE %s", state);
+    respond(buf);
 }
 
 /* ========================= GPIO function ================================== */
@@ -531,7 +1224,8 @@ void seg_set_display(const char* str){
 
     while(i < DISP_LEN && str[j] != '\0'){
 
-        char c = toupper((unsigned char)str[j]);
+        char c = str[j];
+		c = toupper(c);
 
         if(c == '.'){
             if(i > 0){
@@ -612,11 +1306,13 @@ void boot_display(void) {
 			led_on(0xFF);
             break;
             
-        case 7: // 进入正常时钟显示
+		case 7: // 进入正常时钟显示
 			seg_clear();
 			led_on(0x00);
-            system_mode = MODE_SHOW_TIME;
-            break;
+			user_msg_active = 0;
+			msg_scroll_offset = 0;
+		    system_mode = MODE_SHOW_TIME;
+		    break;
             
         default: 
             break;
@@ -752,21 +1448,21 @@ void add_sys_year(void) {
 
 
 void show_time(void){
-	char str[16];
-	sprintf(str, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
-	seg_set_display(str);
+	char buf[16];
+	sprintf(buf, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
+	seg_set_display(buf);
 }
 
 void show_date_1(void){
-	char str[16];
-	sprintf(str, "%02d.%02d.%02d", system_date.year%100, system_date.month, system_date.day);
-	seg_set_display(str);
+	char buf[16];
+	sprintf(buf, "%02d.%02d.%02d", system_date.year%100, system_date.month, system_date.day);
+	seg_set_display(buf);
 }
 
 void show_date_2(void){
-	char str[16];
-	sprintf(str, "%04d.%02d.%02d", system_date.year, system_date.month, system_date.day);
-	seg_set_display(str);
+	char buf[16];
+	sprintf(buf, "%04d.%02d.%02d", system_date.year, system_date.month, system_date.day);
+	seg_set_display(buf);
 }
 
 void alarm(void){
@@ -775,6 +1471,8 @@ void alarm(void){
 	if(alarm_tick >= 10){
 		Buzzer_Off();
 		alarming = 0;
+		alarm_tick = 0;
+		evt_send_alarm_off();
 	}else{
 		Buzzer_Toggle();
 		alarm_tick++;
@@ -836,9 +1534,10 @@ void key_scan(void){
 		{
 			if(key_pressed_time[i] < KEY_PRESS_TIME){
 				key_pressed_time[i] += SYSTICK_FREQUENCY / KEY_SCAN_FREQ;
-			}else if(key_pressed_time[i] != 0xFFFF){
+						}else if(key_pressed_time[i] != 0xFFFF){
 				ev.key = i+1;
 				ev.state = KEY_PRESS;
+				ev.source = ON_BORAD;
 				key_push(ev);
 				key_pressed_time[i] = 0xFFFF;
 			}
@@ -846,10 +1545,12 @@ void key_scan(void){
 			if(key_pressed_time[i] == 0xFFFF){
 				ev.key = i+1;
 				ev.state = KEY_PRESSUP;
+				ev.source = ON_BORAD;
 				key_push(ev);
 			}else if(key_pressed_time[i] > KEY_DEBOUNCE_TIME){
 				ev.key = i+1;
 				ev.state = KEY_TAP;
+				ev.source = ON_BORAD;
 				key_push(ev);
 			}
 			
@@ -865,9 +1566,30 @@ void key_scan(void){
 	@details 从按键事件队列中取事件，并分发到各自的回调函数中处理
 */
 void key_event_dispatch(void){
-	KEY_EVENT *ev;
+	static KEY_EVENT *ev;
 	ev = key_pop();
 	if(ev == NULL) return;
+
+	// 物理按键按下时上报 *EVT:KEY（仅在 ON_BORAD 来源时）
+	if(ev->source == ON_BORAD) {
+		static const char *key_names[] = {
+			"FUNC", "SHIFT", "ADD", "SAVE", "DISP", "SPEED", "FORMAT", "EXT", "USER1", "USER2"
+		};
+		evt_send_key(key_names[(ev->key) - 1]);
+	}
+
+	// 滚动消息期间，按任意键（除FUNC/ADD编辑键外）中断流水回到时钟
+	if (user_msg_active && (int)strlen(user_msg) > DISP_LEN) {
+		if ((ev->key != KEY_FUNC) && (ev->key != KEY_ADD)) {
+			user_msg_active = 0;
+			msg_scroll_offset = 0;
+			if (system_mode == MODE_SHOW_TIME) show_time();
+			else if (system_mode == MODE_SHOW_DATE_1) show_date_1();
+			else if (system_mode == MODE_SHOW_DATE_2) show_date_2();
+			return;
+		}
+	}
+
 	key_cb[(ev->key)-1](*ev);
 }
 
@@ -882,6 +1604,7 @@ void KEY_FUNC_Cb(KEY_EVENT ev)
 			if(alarming == 1){
 				alarming = 0;
 				Buzzer_Off();
+				evt_send_alarm_off();
 				break;
 			}
 			if (system_mode != MODE_SETTING){
@@ -975,7 +1698,9 @@ void KEY_SAVE_Cb(KEY_EVENT ev)
 	switch (ev.state){
 		case KEY_TAP:
 		case KEY_PRESS:
-			quit_setting();
+			if(system_mode == MODE_SETTING){
+				quit_setting();
+			}
 			break;
 		case KEY_PRESSUP:
 		case KEY_IDLE:
@@ -1012,9 +1737,11 @@ void KEY_DISP_Cb(KEY_EVENT ev)
 }
 void KEY_SPEED_Cb(KEY_EVENT ev)
 {
-    // Implement KEY_SPEED handling logic here
+    // 滚动速度切换: 250ms / 500ms
 	switch (ev.state){
 		case KEY_TAP:
+			scroll_speed = (scroll_speed == 500) ? 250 : 500;
+			break;
 		case KEY_PRESS:
 		case KEY_PRESSUP:
 		case KEY_IDLE:
@@ -1024,10 +1751,12 @@ void KEY_SPEED_Cb(KEY_EVENT ev)
 }
 void KEY_FORMAT_Cb(KEY_EVENT ev)
 {
-    // Implement KEY_FORMAT handling logic here
+    // 滚动方向切换: LEFT(0) / RIGHT(1)
 	switch (ev.state){
 		case KEY_TAP:
 		case KEY_PRESS:
+			display_format = (display_format == FORMAT_LEFT) ? FORMAT_RIGHT : FORMAT_LEFT;
+			break;
 		case KEY_PRESSUP:
 		case KEY_IDLE:
 		default:
@@ -1124,6 +1853,13 @@ void UART0_Handler(void)
 		char ch = UARTCharGetNonBlocking(UART0_BASE);
 		if(RxBufIndex < UART_BUFFER_SIZE - 1){
 			RxBuf[RxBufIndex++] = ch;
+			if (ch == '\r' || ch == '\n') {
+				RxBuf[RxBufIndex] = '\0';
+				RxBufIndex = 0;
+				RxEndFlag = 1;
+			}
+		} else {
+			RxBufIndex = 0;
 		}
 	}
 
@@ -1321,6 +2057,8 @@ int main(void)
 	volatile uint16_t i2c_flash_cnt,gpio_flash_cnt;
 
 	uint8_t i;		// for循环使用
+
+	char tmp[UART_BUFFER_SIZE];
 	
 	ui32SysClock = SysCtlClockFreqSet((SYSCTL_XTAL_16MHZ |SYSCTL_OSC_INT | SYSCTL_USE_PLL |SYSCTL_CFG_VCO_480), 20000000);
 	
@@ -1336,34 +2074,65 @@ int main(void)
 	{	
 		if(flag_1s == 1){
 			flag_1s = 0;
-			if(system_mode != MODE_BOOT){
+			if (system_mode != MODE_BOOT){
 				add_sys_sec();
 			}
 
-			switch(system_mode){
-				case MODE_BOOT: 
-					boot_display();
-					break;
-				case MODE_SHOW_TIME: 
-					show_time(); 
-					break; 
-				case MODE_SHOW_DATE_1:
-					show_date_1();
-					break;
-				case MODE_SHOW_DATE_2:
-					show_date_2();
-					break;
-				case MODE_SETTING:
-					break;
-				default: break;
+			/* 用户消息 ≤8位: 静态显示 2秒后自动退出 */
+			if (user_msg_active && (int)strlen(user_msg) <= DISP_LEN) {
+				if (systick_count - last_msg_scroll_tick >= 2 * SYSTICK_FREQUENCY) {
+					user_msg_active = 0;
+					msg_scroll_offset = 0;
+				}
 			}
+
+			if (!user_msg_active) {
+				switch(system_mode){
+					case MODE_BOOT: 
+						boot_display();
+						break;
+					case MODE_SHOW_TIME: 
+						show_time(); 
+						break; 
+					case MODE_SHOW_DATE_1:
+						show_date_1();
+						break;
+					case MODE_SHOW_DATE_2:
+						show_date_2();
+						break;
+					case MODE_SETTING:
+						break;
+					default: break;
+				}
+			}
+
+			/* 数码管不亮时，显示也需更新缓存(为了心跳上报) */
+			if (!display_on) {
+				seg_clear();
+				led_on(0x00);
+			}
+
 			if(time_equal(alarm_time, system_time))	// 闹钟时间到
 			{
 				alarming = 1;
+				evt_send_alarm();
 			}
 			if(alarming == 1){
 				alarm();
 			}
+
+			/* 远程蜂鸣超时检查 */
+			if (remote_beep_ms > 0) {
+				uint32_t elapsed = (systick_count - remote_beep_start_tick) * (1000 / SYSTICK_FREQUENCY);
+				if (elapsed >= remote_beep_ms) {
+					Buzzer_Off();
+					remote_beep_ms = 0;
+				}
+			}
+
+			/* 1秒心跳：*EVT:DISP 和 *EVT:LED */
+			evt_send_disp();
+			evt_send_led();
 		}
 		
 		if(flag_2ms == 1){
@@ -1382,7 +2151,36 @@ int main(void)
 
 		if(flag_100ms == 1){
 			flag_100ms = 0;
-			
+
+			/* >8位滚动消息：按scroll_speed速率滚动 */
+			if (user_msg_active && (int)strlen(user_msg) > DISP_LEN) {
+				int msg_len = (int)strlen(user_msg);
+				if (msg_len > 0) {
+					if (systick_count - last_msg_scroll_tick >= (uint32_t)(scroll_speed * SYSTICK_FREQUENCY / 1000)) {
+						char display_str[DISP_LEN + 1] = {0};
+						int j;
+						last_msg_scroll_tick = systick_count;
+						msg_scroll_offset++;
+						for (j = 0; j < DISP_LEN; j++) {
+							int pos;
+							if (display_format == FORMAT_LEFT) {
+								pos = (j + msg_scroll_offset) % msg_len;
+							} else {
+								pos = (msg_len - 1 - (j + msg_scroll_offset) % msg_len + msg_len) % msg_len;
+							}
+							display_str[j] = user_msg[pos];
+						}
+						display_str[DISP_LEN] = '\0';
+						seg_set_display(display_str);
+						/* 走完一遍后自动退出 */
+						if (msg_scroll_offset >= msg_len) {
+							user_msg_active = 0;
+							msg_scroll_offset = 0;
+						}
+					}
+				}
+			}
+
 			if(is_add_pressing == 1){
 				add_cur_subitem();
 			}
@@ -1391,24 +2189,9 @@ int main(void)
 		if(RxEndFlag == 1){
 			RxEndFlag = 0;
 
-			strcpy(str, (const char *)RxBuf);
-			strtok(str, "\r\n");
-			for(i = 0; i < strlen(str); i++){
-				str[i] = toupper(str[i]);
-			}
-
-			if(strcmp(str, "AT+CLASS") == 0){
-				sprintf(TxBuf, "Class ID: %s\r\n", MY_CLASS_ID);
-				UARTStringPutNonBlocking(TxBuf);
-			}
-			else if(strcmp(str, "AT+ID") == 0){
-				sprintf(TxBuf, "Student ID: %s\r\n", MY_STUDENT_ID);
-				UARTStringPutNonBlocking(TxBuf);
-			}
-			else{
-				sprintf(TxBuf, "Unknown command: %s\r\n", str);
-				UARTStringPutNonBlocking(TxBuf);
-			}
+			strcpy(tmp, (const char *)RxBuf);
+			strtok(tmp, "\r\n");
+			process_command(tmp);
 		}
 
 
