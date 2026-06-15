@@ -66,26 +66,6 @@
 #define ERROR_LEN_STR			"ERROR LEN"
 #define ERROR_BUSY_STR			"ERROR BUSY"
 
-/* ---------- 滚动方向 ---------- */
-typedef enum {
-    FORMAT_LEFT = 0,
-    FORMAT_RIGHT
-} FORMAT_DIR;
-FORMAT_DIR display_format = FORMAT_LEFT;     // 默认左向
-
-bool display_on = true;                       // 数码管亮灭
-char user_msg[PROTO_MSG_MAX_LEN + 1] = {0};   // 用户自定义滚动消息
-volatile uint8_t user_msg_active = 0;          // 是否有滚动消息
-
-/* MSG文本的当前起始显示位置(用于滚动), 负数表示不滚动 */
-volatile int16_t msg_scroll_offset = 0;
-volatile uint32_t last_msg_scroll_tick = 0;
-volatile uint8_t scroll_speed = 500;       // 滚动速度 (ms), 默认500ms
-
-/* 远程蜂鸣时长 */
-volatile uint32_t remote_beep_ms = 0;
-volatile uint32_t remote_beep_start_tick = 0;	
-
 
 /* =========================================================================== */
 /*                    变量定义&函数声明                                         */
@@ -104,9 +84,6 @@ void Delay(uint32_t value)
 	uint32_t ui32Loop;
 	for(ui32Loop = 0; ui32Loop < value; ui32Loop++){};
 }
-
-// volatile uint8_t result,cnt,key_value,gpio_status;
-// volatile uint8_t rightshift = 0x01;
 
 /* =================== GPIO ====================== */
 void S800_GPIO_Init(void);
@@ -134,14 +111,13 @@ void S800_UART_Init(void);
 void UARTStringPut(const char *cMessage);
 void UARTStringPutNonBlocking(const unsigned char *msg);
 
-/* =================== 协议处理函数 ====================== */
+/* =================== 串口通信协议 ====================== */
 
 // ---- 辅助工具 ----
 #define toupper(c) (((c) >= 'a' && (c) <= 'z') ? ((c) - 0x20) : (c))
 
 void str_toupper(char *s);
-void str_reverse(char *dst, const char *src, int len);
-void format_reverse(char *buf, const char *val);
+void str_reverse(char *dst, const char *src);
 void respond(const char *resp);
 void respond_error(const char *err);
 void respond_ok_data(const char *data);
@@ -197,7 +173,7 @@ const uint8_t seg7_digit[]  = {
     0x58,   // C
     0x5e,   // D
     0x79,   // E
-    0x71    // F
+    0x71,   // F
 };
 
 const uint8_t seg7_letter[] = {
@@ -226,26 +202,14 @@ const uint8_t seg7_letter[] = {
 	0x6a, // W
 	0x36, // X
 	0x6e, // Y
-		0x49  // Z
+	0x49  // Z
 };
 
-static char seg7_glyph_to_char(uint8_t glyph) {
-	int i;
-    // 先在数字表里找
-    for (i = 0; i < 16; i++) {
-        if (seg7_digit[i] == glyph)
-            return (i < 10) ? ('0' + i) : ('A' + (i - 10));
-    }
-    // 再在字母表里找
-    for (i = 0; i < 26; i++) {
-        if (seg7_letter[i] == glyph)
-            return 'A' + i;
-    }
-    return '_';
-}
+static char to_seg7(const char ch);
 
-uint8_t seg_display_buffer[DISP_LEN] = {0};	// 数码管显示内容缓存
-static uint8_t seg_display_pos = 0;
+// 数码管显示内容缓存
+uint8_t seg_disp_buf[DISP_LEN] = {0};
+uint8_t seg_disp_dp = 0;
 
 void seg_write(uint8_t pos, uint8_t value);
 void seg_set_display(const char* str);
@@ -254,12 +218,25 @@ void seg_refresh(void);
 
 void boot_display(void);
 
-uint8_t scroll_str[64] = {0};
-// typedef enum{
-// 	SCROLL_IDLE = 0,
-// 	SCROLL_LEFT, 
-// 	SCROLL_RIGHT
-// } SCROLL_DIR;
+/* ---------- 滚动流水 ---------- */
+typedef enum {
+    FORMAT_LEFT = 0,
+    FORMAT_RIGHT
+} FORMAT_DIR;
+FORMAT_DIR display_format = FORMAT_LEFT;     // 默认左向
+
+bool display_on = true;                       // 数码管亮灭
+char user_msg[PROTO_MSG_MAX_LEN + 1] = {0};   // 用户自定义滚动消息
+volatile uint8_t user_msg_active = 0;          // 是否有滚动消息
+
+/* MSG文本的当前起始显示位置(用于滚动), 负数表示不滚动 */
+volatile int16_t msg_scroll_offset = 0;
+volatile uint32_t last_msg_scroll_tick = 0;
+volatile uint8_t scroll_speed = 500;       // 滚动速度 (ms), 默认500ms
+
+/* 远程蜂鸣时长 */
+volatile uint32_t remote_beep_ms = 0;
+volatile uint32_t remote_beep_start_tick = 0;	
 
 /* ================= 电子时钟 ================ */
 
@@ -304,7 +281,7 @@ void show_time(void);
 void show_date_1(void);
 void show_date_2(void);
 
-time_t alarm_time = {19, 0, 5};
+time_t alarm_time = {12, 1, 0};
 volatile uint8_t alarming = 0;
 
 void alarm(void);
@@ -472,7 +449,9 @@ void UARTStringPutNonBlocking(const unsigned char *msg)
 	}
 }
 
-/* ========================= 协议工具函数 ================================== */
+/* ========================= 串口通信协议 ================================== */
+
+/* ----------- 工具函数 ------------ */
 
 void str_toupper(char *s)
 {
@@ -482,29 +461,14 @@ void str_toupper(char *s)
     }
 }
 
-void str_reverse(char *dst, const char *src, int len)
+void str_reverse(char *dst, const char *src)
 {
     int i;
+	int len = strlen(src);
     for (i = 0; i < len; i++) {
         dst[i] = src[len - 1 - i];
     }
     dst[len] = '\0';
-}
-
-void format_reverse(char *buf, const char *val)
-{
-    int len = (int)strlen(val);
-    int i, j = 0;
-    char tmp[PROTO_MAX_FRAME_LEN];
-    for (i = 0; i < len; i++) {
-        tmp[i] = val[len - 1 - i];
-    }
-    tmp[len] = '\0';
-
-    for (i = 0; i < len; i++) {
-        buf[j++] = tmp[i];
-    }
-    buf[j] = '\0';
 }
 
 void respond(const char *resp)
@@ -654,8 +618,9 @@ void cmd_RST(void)
 // ---- *SET 实现 ----
 void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
 {
-    char type_str[PROTO_MAX_FRAME_LEN/2] = {0};
-    int i = 0;
+	int i = 0;
+    static char type_str[PROTO_MAX_FRAME_LEN/2];
+	memcpy(type_str, 0, sizeof(type_str));
 
     if (argc < 1) {
         respond_error(ERROR_SYNTAX_STR);
@@ -1003,7 +968,7 @@ void cmd_GET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
 
     if (display_format == FORMAT_RIGHT) {
         char rev[PROTO_MAX_FRAME_LEN];
-        str_reverse(rev, data, (int)strlen(data));
+        str_reverse(rev, data);
         respond_ok_data(rev);
     } else {
         respond_ok_data(data);
@@ -1021,30 +986,15 @@ void cmd_PING(void)
 // ---- 主动上报函数 ----
 void evt_send_edit(const char *type, const char *value)
 {
-    char buf[PROTO_MAX_FRAME_LEN];
+    static char buf[PROTO_MAX_FRAME_LEN];
     sprintf(buf, "*EVT:EDIT %s %s", type, value);
     respond(buf);
 }
 
 void evt_send_disp(void)
 {
-    char display_str[9];
-    uint8_t dp_bits = 0;
-    int i;
-	char buf[PROTO_MAX_FRAME_LEN];
-
-    for (i = 0; i < DISP_LEN; i++) {
-        uint8_t seg = seg_display_buffer[i];
-        bool is_dp = (seg & 0x80) ? true : false;
-        uint8_t glyph = seg & 0x7F;
-        display_str[i] = seg7_glyph_to_char(glyph);
-        if (is_dp) {
-            dp_bits |= (uint8_t)(1 << i);
-        }
-    }
-    display_str[DISP_LEN] = '\0';
-
-    sprintf(buf, "*EVT:DISP %s %02X", display_str, dp_bits);
+	static char buf[PROTO_MAX_FRAME_LEN];
+	sprintf(buf, "*EVT:DISP %s %02X", seg_disp_buf, seg_disp_dp);
     respond(buf);
 }
 
@@ -1212,6 +1162,19 @@ void led_on(uint8_t bitmap){
 
 /* ========================= 七段数码管显示 ================================== */
 
+static char to_seg7(const char ch){
+	if(ch>='0' && ch<='9'){
+		return seg7_digit[ch-'0'];
+	}
+	if(ch>='A' && ch<='Z'){
+		return seg7_letter[ch-'A'];
+	}
+	if(ch=='-') return 0x40;
+	if(ch=='_') return 0x08;
+	if(ch=='°') return 0x63;
+	return 0x00;
+}
+
 void seg_write(uint8_t pos, uint8_t value){
 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT1,value);			
 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2,(uint8_t)(1<<pos));
@@ -1224,45 +1187,47 @@ void seg_set_display(const char* str){
 
     while(i < DISP_LEN && str[j] != '\0'){
 
-        char c = str[j];
-		c = toupper(c);
+        char c = toupper(str[j]);
+		j++;
 
         if(c == '.'){
             if(i > 0){
-                seg_display_buffer[i - 1] |= 0x80;
+                seg_disp_dp |= (uint8_t)(1<<i-1);
             }
-            j++;
             continue;
         }
 
-        if(c >= '0' && c <= '9'){
-            seg_display_buffer[i] = seg7_digit[c - '0'];
-        }
-        else if(c >= 'A' && c <= 'Z'){
-            seg_display_buffer[i] = seg7_letter[c - 'A'];
-        }
-        else{
-            seg_display_buffer[i] = 0x00;
+		
+        if((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c=='_' || c=='-' || c=='°'){
+            seg_disp_buf[i] = c;
+        }else{
+            seg_disp_buf[i] = 0x00;
         }
 
-        i++;
-        j++;
+		i++;
     }
 
     while(i < DISP_LEN){
-        seg_display_buffer[i++] = 0x00;
+        seg_disp_buf[i++] = 0x00;
     }
 }
 
 void seg_clear(void){
-	memset(seg_display_buffer, 0, sizeof(seg_display_buffer));
+	memset(seg_disp_buf, 0, sizeof(seg_disp_buf));
+	seg_disp_dp = 0;
 }
 
 void seg_refresh(void)				// 数码管刷新任务
 {
-	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2,(uint8_t)0x00);
-	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT1,seg_display_buffer[seg_display_pos]);			
-	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2,(uint8_t)(1<<seg_display_pos));
+	static uint8_t seg_display_pos = 0;
+	static char c;
+	c = to_seg7(seg_disp_buf[seg_display_pos]);
+	if((seg_disp_dp & (uint8_t)(1<<seg_display_pos)) != 0x00){
+		c |= 0x80;
+	}
+	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2, (uint8_t)0x00);
+	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT1, (uint8_t)c);			
+	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2, (uint8_t)(1<<seg_display_pos));
 	seg_display_pos = (seg_display_pos + 1) % 8;
 }
 
@@ -1272,7 +1237,7 @@ void boot_display(void) {
 
     switch(boot_step) {
         case 0: // 1. 8位数码管+8位LED全亮
-			memset(seg_display_buffer, 0xFF, DISP_LEN);
+			memset(seg_disp_buf, 0xFF, DISP_LEN);
             led_on(0xFF);
             break;
             
@@ -2206,7 +2171,7 @@ int main(void)
 		// 		case 0:{
 		// 			int i;
 		// 			for(i=0; i<8; ++i){
-		// 				seg_display_buffer[i] = 0xFF;
+		// 				seg_disp_buf[i] = 0xFF;
 		// 			}
 		// 			break;
 		// 		}
@@ -2233,7 +2198,7 @@ int main(void)
 		// 	flag_5ms == 0;
 		// 	/* 数码管刷新 */	
 		// 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2,(uint8_t)0x00);
-		// 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT1,seg_display_buffer[seg_display_pos]);			
+		// 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT1,seg_disp_buf[seg_display_pos]);			
 		// 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2,(uint8_t)(1<<seg_display_pos));
 		// 	seg_display_pos = (seg_display_pos + 1) % 8;
 		// }
