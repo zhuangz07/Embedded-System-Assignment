@@ -56,7 +56,7 @@
 
 /* =================== 串口通信协议相关定义 ====================== */
 #define PROTO_MAX_FRAME_LEN     64
-#define PROTO_ARG_MAX            6
+#define PROTO_ARG_MAX            8
 #define PROTO_MSG_MAX_LEN       32
 
 #define OK_STR					"OK"
@@ -70,7 +70,6 @@
 /* =========================================================================== */
 /*                    变量定义&函数声明                                         */
 /* =========================================================================== */
-
 
 /* =============== 系统时钟 & 软定时器 =================== */
 uint32_t ui32SysClock;	//系统时钟频率
@@ -102,9 +101,8 @@ void Buzzer_Toggle(void);
 /* =================== UART ====================== */
 #define UART_BUFFER_SIZE 128
 
-char TxBuf[UART_BUFFER_SIZE];
-volatile char RxBuf[UART_BUFFER_SIZE];
-// volatile uint32_t RxBufIndex = 0;
+char TxBuf[UART_BUFFER_SIZE] = {0};
+volatile char RxBuf[UART_BUFFER_SIZE] = {0};
 volatile uint8_t RxEndFlag = 0;
 
 void S800_UART_Init(void);
@@ -118,6 +116,8 @@ void UARTStringPutNonBlocking(const unsigned char *msg);
 
 void str_toupper(char *s);
 void str_reverse(char *dst, const char *src);
+void extract_dots(const char *src, char *dest, uint32_t *dp);
+
 void respond(const char *resp);
 void respond_error(const char *err);
 void respond_ok_data(const char *data);
@@ -157,7 +157,7 @@ void led_on(uint8_t bitmap);
 
 /* ==================== 数码管 ==================== */
 
-const uint8_t seg7_digit[]  = {
+const uint8_t seg7_digit[] = {
     0x3f,   // 0
     0x06,   // 1
     0x5b,   // 2
@@ -212,31 +212,37 @@ uint8_t seg_disp_buf[DISP_LEN] = {0};
 uint8_t seg_disp_dp = 0;
 
 void seg_write(uint8_t pos, uint8_t value);
-void seg_set_display(const char* str);
+void set_seg_disp_from_string(const char* str);
+void set_seg_disp(const char* str, const uint8_t dp);
 void seg_clear(void);
 void seg_refresh(void);
 
 void boot_display(void);
+uint8_t boot_step = 0;
+
+bool display_on = true;                       // 数码管亮灭
 
 /* ---------- 滚动流水 ---------- */
 typedef enum {
     FORMAT_LEFT = 0,
     FORMAT_RIGHT
 } FORMAT_DIR;
-FORMAT_DIR display_format = FORMAT_LEFT;     // 默认左向
+FORMAT_DIR display_format = FORMAT_LEFT;     	// 默认左向
 
-bool display_on = true;                       // 数码管亮灭
-char user_msg[PROTO_MSG_MAX_LEN + 1] = {0};   // 用户自定义滚动消息
-volatile uint8_t user_msg_active = 0;          // 是否有滚动消息
+// 用户自定义滚动消息
+char user_msg[PROTO_MSG_MAX_LEN] = {0};   	
+uint32_t user_dp = 0;
 
-/* MSG文本的当前起始显示位置(用于滚动), 负数表示不滚动 */
-volatile int16_t msg_scroll_offset = 0;
+volatile uint8_t user_msg_active = 0;          	// 是否有滚动消息
+volatile int16_t msg_scroll_offset = 0;			// MSG文本的当前起始显示位置(用于滚动), 负数表示不滚动
 volatile uint32_t last_msg_scroll_tick = 0;
-volatile uint8_t scroll_speed = 500;       // 滚动速度 (ms), 默认500ms
+volatile uint8_t scroll_speed = 500;       		// 滚动速度 (ms), 默认500ms
 
-/* 远程蜂鸣时长 */
+void disp_user_msg(void);
+
+/* ---------- 远程蜂鸣 ---------- */
 volatile uint32_t remote_beep_ms = 0;
-volatile uint32_t remote_beep_start_tick = 0;	
+volatile uint32_t remote_beep_start_tick = 0;
 
 /* ================= 电子时钟 ================ */
 
@@ -379,10 +385,11 @@ typedef enum{
 	MODE_SHOW_TIME,
 	MODE_SHOW_DATE_1,
 	MODE_SHOW_DATE_2,
-	MODE_SETTING
+	MODE_SETTING,
+	MODE_SHOW_USER_MSG
 } SYSTEM_MODE;		// 系统显示模式
-SYSTEM_MODE system_mode = MODE_SHOW_TIME;
-SYSTEM_MODE temp_mode = MODE_BOOT;		// 用于进入设置项后，保存进入前的模式
+SYSTEM_MODE system_mode = MODE_BOOT;
+SYSTEM_MODE temp_mode = MODE_BOOT;		// 用于进入设置项/显示用户信息时，保存进入前的模式
 
 typedef enum{
 	SET_DATE = 0,
@@ -416,8 +423,7 @@ void quit_setting(void);
 
 /* ========================= UART function ================================== */
 
-void S800_UART_Init(void)
-{
+void S800_UART_Init(void){
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
   	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);						//Enable PortA
 	while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOA));			//Wait for the GPIO moduleA ready
@@ -435,14 +441,12 @@ void S800_UART_Init(void)
 	// UARTStringPut((uint8_t *)"Hello, world!\r\n");
 }
 
-void UARTStringPut(const char *cMessage)
-{
+void UARTStringPut(const char *cMessage){
 	while(*cMessage!='\0')
 		UARTCharPut(UART0_BASE,*(cMessage++));
 }
 
-void UARTStringPutNonBlocking(const unsigned char *msg)
-{
+void UARTStringPutNonBlocking(const unsigned char *msg){
 	while(*msg != '\0') {
 		if (UARTSpaceAvail(UART0_BASE)) //发送FIFO有空位
 			UARTCharPutNonBlocking(UART0_BASE, *msg++); //发送一个字符
@@ -453,16 +457,14 @@ void UARTStringPutNonBlocking(const unsigned char *msg)
 
 /* ----------- 工具函数 ------------ */
 
-void str_toupper(char *s)
-{
+void str_toupper(char *s){
     while (*s) {
         *s = (char)toupper((unsigned char)*s);
         s++;
     }
 }
 
-void str_reverse(char *dst, const char *src)
-{
+void str_reverse(char *dst, const char *src){
     int i;
 	int len = strlen(src);
     for (i = 0; i < len; i++) {
@@ -471,32 +473,42 @@ void str_reverse(char *dst, const char *src)
     dst[len] = '\0';
 }
 
-void respond(const char *resp)
-{
+void extract_dots(const char *src, char *dest, uint32_t *dp){
+	int dest_idx = 0;
+    *dp = 0u;
+    for (; *src != '\0'; ++src) {
+        if (*src == '.') {
+            *dp |= (1u << (dest_idx - 1));
+        } else {
+            dest[dest_idx++] = *src;
+        }
+    }
+
+    dest[dest_idx] = '\0';
+}
+
+
+void respond(const char *resp){
     UARTStringPutNonBlocking((const unsigned char *)resp);
     UARTStringPutNonBlocking((const unsigned char *)"\r\n");
 }
 
-void respond_error(const char *err)
-{
+void respond_error(const char *err){
     respond(err);
 }
 
-void respond_ok_data(const char *data)
-{
+void respond_ok_data(const char *data){
     char buf[PROTO_MAX_FRAME_LEN];
     sprintf(buf, "%s %s", OK_STR, data);
     respond(buf);
 }
 
-void respond_ok(void)
-{
+void respond_ok(void){
     respond(OK_STR);
 }
 
 // ---- 大小写无关的缩写匹配 ----
-bool match_abbr(const char *input, const char *pattern)
-{
+bool match_abbr(const char *input, const char *pattern){
     int i = 0, j = 0;
     while (input[i] != '\0' && pattern[j] != '\0') {
         if (toupper((unsigned char)input[i]) != toupper((unsigned char)pattern[j])) {
@@ -519,8 +531,7 @@ bool match_abbr(const char *input, const char *pattern)
 
 // ---- 帧解析 ----
 bool parse_frame(const char *raw, char *cmd, int cmd_size,
-                 char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int *argc)
-{
+                 char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int *argc){
     static char tmp[PROTO_MAX_FRAME_LEN + 1];
     char *token;
     int i;
@@ -537,7 +548,7 @@ bool parse_frame(const char *raw, char *cmd, int cmd_size,
     strncpy(tmp, raw, PROTO_MAX_FRAME_LEN);
     tmp[PROTO_MAX_FRAME_LEN] = '\0';
 
-    token = strtok(tmp, " :\t");
+    token = strtok(tmp, ": \t");
     if (token == NULL) {
         return false;
     }
@@ -553,14 +564,34 @@ bool parse_frame(const char *raw, char *cmd, int cmd_size,
         strncpy(args[*argc], token, (PROTO_MAX_FRAME_LEN/2) - 1);
         args[*argc][PROTO_MAX_FRAME_LEN/2 - 1] = '\0';
         (*argc)++;
+
+		// *SET:MSG 时, 不再分割后续消息，直接取剩余原始字符串
+		if(strcmp(cmd, "*SET") == 0 && strcmp(token, "MSG") == 0){
+			/* strtok 已将 tmp 中的空格替换为 '\0'，
+			 * token 指向 tmp 内部，token + strlen(token) + 1 即为下一段起始 */
+			char *rest = token + strlen(token) + 1;
+			/* 跳过前导空格 */
+			while (*rest == ' ' || *rest == '\t') rest++;
+			if (*rest == '\0') {
+				respond_error(ERROR_SYNTAX_STR);
+				return false;
+			}
+			if (strlen(rest) > (PROTO_MAX_FRAME_LEN/2) - 1) {
+				respond_error(ERROR_LEN_STR);
+				return false;
+			}
+			strncpy(args[*argc], rest, (PROTO_MAX_FRAME_LEN/2) - 1);
+			args[*argc][PROTO_MAX_FRAME_LEN/2 - 1] = '\0';
+			(*argc)++;
+			return true;
+		}
     }
 
     return true;
 }
 
 // ---- 命令处理主入口 ----
-void process_command(const char *raw)
-{
+void process_command(const char *raw){
     static char cmd[PROTO_MAX_FRAME_LEN];
     static char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2];
     int argc = 0;
@@ -591,8 +622,7 @@ void process_command(const char *raw)
 }
 
 // ---- *RST 实现 ----
-void cmd_RST(void)
-{
+void cmd_RST(void){
     system_date.year = 2026;
     system_date.month = 6;
     system_date.day = 1;
@@ -606,21 +636,18 @@ void cmd_RST(void)
     msg_scroll_offset = 0;
     scroll_speed = 500;
 	remote_beep_ms = 0;
+    system_mode = MODE_BOOT;
+	boot_step = 0;
+	systick_count = 0;
 
-    if (system_mode == MODE_SETTING) {
-        system_mode = MODE_SHOW_TIME;
-    }
-
-    show_time();
     respond_ok();
 }
 
 // ---- *SET 实现 ----
-void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
-{
+void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
 	int i = 0;
     static char type_str[PROTO_MAX_FRAME_LEN/2];
-	memcpy(type_str, 0, sizeof(type_str));
+	memset(type_str, 0, sizeof(type_str));
 
     if (argc < 1) {
         respond_error(ERROR_SYNTAX_STR);
@@ -630,41 +657,49 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
     strncpy(type_str, args[0], sizeof(type_str) - 1);
     str_toupper(type_str);
 
-    // ---- *SET:DATE ----
+        // ---- *SET:DATE ----
     if (match_abbr(type_str, "DATE")) {
-		int v;
-        int idx = 1;
-		date_t new_date = system_date;
+        int v;
+        int i;
+        int kw_count = 0;
+        int val_start;
+        static char kws[3][PROTO_MAX_FRAME_LEN/2];
+        date_t new_date = system_date;
 
-        while (idx < argc) {
-            char kw[PROTO_MAX_FRAME_LEN/2] = {0};
-            strncpy(kw, args[idx], sizeof(kw) - 1);
-            kw[sizeof(kw) - 1] = '\0';
-            str_toupper(kw);
-
-            if (match_abbr(kw, "YEAR")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
-                if (v < 1960 || v > 2099) { respond_error(ERROR_RANGE_STR); return; }
-                                new_date.year = (uint16_t)v;
-            } else if (match_abbr(kw, "MONTH")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
-                if (v < 1 || v > 12) { respond_error(ERROR_RANGE_STR); return; }
-                                new_date.month = (uint8_t)v;
-            } else if (match_abbr(kw, "DATE")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
-                if (v < 1 || v > 31) { respond_error(ERROR_RANGE_STR); return; }
-                                new_date.day = (uint8_t)v;
+        /* 第一遍：统计关键字数量（遇到第一个非关键字 token 为止） */
+        for (i = 1; i < argc && kw_count < 3; i++) {
+            static char tmp[PROTO_MAX_FRAME_LEN/2];
+            strncpy(tmp, args[i], sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+            str_toupper(tmp);
+            if (match_abbr(tmp, "YEAR") || match_abbr(tmp, "MONTH") || match_abbr(tmp, "DATE")) {
+                strncpy(kws[kw_count], tmp, sizeof(kws[0]) - 1);
+                kws[kw_count][sizeof(kws[0]) - 1] = '\0';
+                kw_count++;
             } else {
-                respond_error(ERROR_SYNTAX_STR);
-                return;
+                break;
             }
-            idx++;
+        }
+        val_start = 1 + kw_count;
+
+        if (kw_count == 0 || (argc - val_start) != kw_count) {
+            respond_error(ERROR_PARAM_STR);
+            return;
+        }
+
+        /* 第二遍：按顺序将值赋给对应字段 */
+        for (i = 0; i < kw_count; i++) {
+            v = (int)strtol(args[val_start + i], NULL, 10);
+            if (match_abbr(kws[i], "YEAR")) {
+                if (v < 1960 || v > 2099) { respond_error(ERROR_RANGE_STR); return; }
+                new_date.year = (uint16_t)v;
+            } else if (match_abbr(kws[i], "MONTH")) {
+                if (v < 1 || v > 12) { respond_error(ERROR_RANGE_STR); return; }
+                new_date.month = (uint8_t)v;
+            } else if (match_abbr(kws[i], "DATE")) {
+                if (v < 1 || v > 31) { respond_error(ERROR_RANGE_STR); return; }
+                new_date.day = (uint8_t)v;
+            }
         }
 
         if (!is_valid_date(new_date)) {
@@ -679,49 +714,57 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
             sprintf(buf, "%04d.%02d.%02d", system_date.year, system_date.month, system_date.day);
             evt_send_edit("DATE", buf);
         }
-        if (system_mode == MODE_SHOW_TIME) {
-            show_time();
-        } else if (system_mode == MODE_SHOW_DATE_1 || system_mode == MODE_SHOW_DATE_2) {
+        if (system_mode == MODE_SHOW_DATE_1) {
             show_date_1();
-        }
+        }else if(system_mode == MODE_SHOW_DATE_2){
+			show_date_2();
+		}
         return;
     }
 
-    // ---- *SET:TIME ----
+        // ---- *SET:TIME ----
     if (match_abbr(type_str, "TIME")) {
-		int v;
-        int idx = 1;
+        int v;
+        int i;
+        int kw_count = 0;
+        int val_start;
+        static char kws[3][PROTO_MAX_FRAME_LEN/2];
         time_t new_time = system_time;
 
-        while (idx < argc) {
-            char kw[PROTO_MAX_FRAME_LEN/2];
-            strncpy(kw, args[idx], sizeof(kw) - 1);
-            kw[sizeof(kw) - 1] = '\0';
-            str_toupper(kw);
+        /* 第一遍：统计关键字数量 */
+        for (i = 1; i < argc && kw_count < 3; i++) {
+            static char tmp[PROTO_MAX_FRAME_LEN/2];
+            strncpy(tmp, args[i], sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+            str_toupper(tmp);
+            if (match_abbr(tmp, "HOUR") || match_abbr(tmp, "MINute") || match_abbr(tmp, "SECond")) {
+                strncpy(kws[kw_count], tmp, sizeof(kws[0]) - 1);
+                kws[kw_count][sizeof(kws[0]) - 1] = '\0';
+                kw_count++;
+            } else {
+                break;
+            }
+        }
+        val_start = 1 + kw_count;
 
-            if (match_abbr(kw, "HOUR")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
+        if (kw_count == 0 || (argc - val_start) != kw_count) {
+            respond_error(ERROR_PARAM_STR);
+            return;
+        }
+
+        /* 第二遍：按顺序赋值 */
+        for (i = 0; i < kw_count; i++) {
+            v = (int)strtol(args[val_start + i], NULL, 10);
+            if (match_abbr(kws[i], "HOUR")) {
                 if (v < 0 || v > 23) { respond_error(ERROR_RANGE_STR); return; }
                 new_time.hour = (uint8_t)v;
-            } else if (match_abbr(kw, "MIN")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
+                        } else if (match_abbr(kws[i], "MINute")) {
                 if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
                 new_time.min = (uint8_t)v;
-            } else if (match_abbr(kw, "SEC")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
+            } else if (match_abbr(kws[i], "SECond")) {
                 if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
                 new_time.sec = (uint8_t)v;
-            } else {
-                respond_error(ERROR_SYNTAX_STR);
-                return;
             }
-            idx++;
         }
 
         if (!is_valid_time(new_time)) {
@@ -742,46 +785,63 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
         return;
     }
 
-    // ---- *SET:ALARM ----
+        // ---- *SET:ALARM ----
     if (match_abbr(type_str, "ALARM")) {
-		int v;
-        int idx = 1;
-                time_t new_alarm = alarm_time;
+        int v;
+        int i;
+        int kw_count = 0;
+        int val_start;
+        static char kws[3][PROTO_MAX_FRAME_LEN/2];
+        time_t new_alarm = alarm_time;
 
-        while (idx < argc) {
-            char kw[PROTO_MAX_FRAME_LEN/2];
-            strncpy(kw, args[idx], sizeof(kw) - 1);
-            kw[sizeof(kw) - 1] = '\0';
-            str_toupper(kw);
-
-            if (match_abbr(kw, "OFF")) {
+        /* OFF 是独立关键字，无对应值，单独处理 */
+        if (argc >= 2) {
+            char tmp[PROTO_MAX_FRAME_LEN/2];
+            strncpy(tmp, args[1], sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+            str_toupper(tmp);
+            if (match_abbr(tmp, "OFF")) {
                 alarming = 0;
                 Buzzer_Off();
-				idx++;
-            } else if (match_abbr(kw, "HOUR")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
+                evt_send_alarm_off();
+                respond_ok();
+                return;
+            }
+        }
+
+        /* 第一遍：统计关键字数量 */
+        for (i = 1; i < argc && kw_count < 3; i++) {
+            char tmp[PROTO_MAX_FRAME_LEN/2];
+            strncpy(tmp, args[i], sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+            str_toupper(tmp);
+            if (match_abbr(tmp, "HOUR") || match_abbr(tmp, "MINute") || match_abbr(tmp, "SECond")) {
+                strncpy(kws[kw_count], tmp, sizeof(kws[0]) - 1);
+                kws[kw_count][sizeof(kws[0]) - 1] = '\0';
+                kw_count++;
+            } else {
+                break;
+            }
+        }
+        val_start = 1 + kw_count;
+
+        if (kw_count == 0 || (argc - val_start) != kw_count) {
+            respond_error(ERROR_PARAM_STR);
+            return;
+        }
+
+        /* 第二遍：按顺序赋值 */
+        for (i = 0; i < kw_count; i++) {
+            v = (int)strtol(args[val_start + i], NULL, 10);
+            if (match_abbr(kws[i], "HOUR")) {
                 if (v < 0 || v > 23) { respond_error(ERROR_RANGE_STR); return; }
                 new_alarm.hour = (uint8_t)v;
-                idx++;
-            } else if (match_abbr(kw, "MIN")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
+                        } else if (match_abbr(kws[i], "MINute")) {
                 if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
                 new_alarm.min = (uint8_t)v;
-                idx++;
-            } else if (match_abbr(kw, "SEC")) {
-                idx++;
-                if (idx >= argc) { respond_error(ERROR_PARAM_STR); return; }
-                v = (int)strtol(args[idx], NULL, 10);
+            } else if (match_abbr(kws[i], "SECond")) {
                 if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
                 new_alarm.sec = (uint8_t)v;
-                idx++;
-            } else {
-                respond_error(ERROR_SYNTAX_STR);
-                return;
             }
         }
 
@@ -791,8 +851,8 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
     }
 
     // ---- *SET:DISPlay ----
-    if (match_abbr(type_str, "DISP")) {
-		char val[PROTO_MAX_FRAME_LEN/2];
+    if (match_abbr(type_str, "DISPlay")) {
+		static char val[PROTO_MAX_FRAME_LEN/2];
         if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
         strncpy(val, args[1], sizeof(val) - 1);
         val[sizeof(val) - 1] = '\0';
@@ -813,7 +873,7 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
 
     // ---- *SET:FORMAT ----
     if (match_abbr(type_str, "FORMAT")) {
-		char val[PROTO_MAX_FRAME_LEN/2];
+		static char val[PROTO_MAX_FRAME_LEN/2];
         if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }        
         strncpy(val, args[1], sizeof(val) - 1);
         val[sizeof(val) - 1] = '\0';
@@ -833,29 +893,16 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
     // ---- *SET:MSG ----
     if (match_abbr(type_str, "MSG")) {
 		int total_len = 0;
-        if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
-        for (i = 1; i < argc; i++) {
-            total_len += (int)strlen(args[i]) + 1;
-        }
-        if (total_len > PROTO_MSG_MAX_LEN + 1) {
-            respond_error(ERROR_LEN_STR);
-            return;
-        }
+        if (argc != 2) { respond_error(ERROR_PARAM_STR); return; }
 		memset(user_msg, 0, sizeof(user_msg));
-        for (i = 1; i < argc; i++) {
-            if (i > 1) strcat(user_msg, " ");
-            strcat(user_msg, args[i]);
-        }
+		extract_dots(args[1], user_msg, &user_dp);
+		temp_mode = system_mode;
+		system_mode = MODE_SHOW_USER_MSG;
         user_msg_active = 1;
         msg_scroll_offset = 0;
         last_msg_scroll_tick = systick_count;
 
-        /* ≤8位静态显示; >8位进入滚动 */
-        if ((int)strlen(user_msg) > DISP_LEN) {
-            seg_set_display(user_msg);
-        } else {
-            seg_set_display(user_msg);
-        }
+        set_seg_disp(user_msg, (uint8_t)user_dp);
         respond_ok();
         return;
     }
@@ -886,27 +933,27 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
 
     // ---- *SET:KEY ----
     if (match_abbr(type_str, "KEY")) {
-		char kw[PROTO_MAX_FRAME_LEN/2] = {0};
+		static char key_id[PROTO_MAX_FRAME_LEN/2] = {0};
 		KEY_EVENT ev;
 
         if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
-        strncpy(kw, args[1], sizeof(kw) - 1);
-        kw[sizeof(kw) - 1] = '\0';
-        str_toupper(kw);
+        strncpy(key_id, args[1], sizeof(key_id) - 1);
+        key_id[sizeof(key_id) - 1] = '\0';
+        str_toupper(key_id);
 
         ev.state = KEY_TAP;
         ev.source = OTHER;
 
-        if (strcmp(kw, "FUNC") == 0)        { ev.key = KEY_FUNC; }
-        else if (strcmp(kw, "SHIFT") == 0)  { ev.key = KEY_SHIFT; }
-        else if (strcmp(kw, "ADD") == 0)    { ev.key = KEY_ADD; }
-        else if (strcmp(kw, "SAVE") == 0)   { ev.key = KEY_SAVE; }
-        else if (strcmp(kw, "DISP") == 0)   { ev.key = KEY_DISP; }
-        else if (strcmp(kw, "SPEED") == 0)  { ev.key = KEY_SPEED; }
-        else if (strcmp(kw, "FORMAT") == 0) { ev.key = KEY_FORMAT; }
-        else if (strcmp(kw, "EXT") == 0)    { ev.key = KEY_EXT; }
-        else if (strcmp(kw, "USER1") == 0)  { ev.key = KEY_USER1; }
-        else if (strcmp(kw, "USER2") == 0)  { ev.key = KEY_USER2; }
+        if (strcmp(key_id, "FUNC") == 0)        { ev.key = KEY_FUNC; }
+        else if (strcmp(key_id, "SHIFT") == 0)  { ev.key = KEY_SHIFT; }
+        else if (strcmp(key_id, "ADD") == 0)    { ev.key = KEY_ADD; }
+        else if (strcmp(key_id, "SAVE") == 0)   { ev.key = KEY_SAVE; }
+        else if (strcmp(key_id, "DISP") == 0)   { ev.key = KEY_DISP; }
+        else if (strcmp(key_id, "SPEED") == 0)  { ev.key = KEY_SPEED; }
+        else if (strcmp(key_id, "FORMAT") == 0) { ev.key = KEY_FORMAT; }
+        else if (strcmp(key_id, "EXT") == 0)    { ev.key = KEY_EXT; }
+        else if (strcmp(key_id, "USER1") == 0)  { ev.key = KEY_USER1; }
+        else if (strcmp(key_id, "USER2") == 0)  { ev.key = KEY_USER2; }
         else {
             respond_error(ERROR_PARAM_STR);
             return;
@@ -938,10 +985,9 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
 }
 
 // ---- *GET 实现 ----
-void cmd_GET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
-{
-    char type_str[PROTO_MAX_FRAME_LEN/2] = {0};
-    char data[PROTO_MAX_FRAME_LEN] = {0};
+void cmd_GET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
+    static char type_str[PROTO_MAX_FRAME_LEN/2] = {0};
+    static char data[PROTO_MAX_FRAME_LEN] = {0};
 
     if (argc < 1) {
         respond_error(ERROR_SYNTAX_STR);
@@ -978,28 +1024,28 @@ void cmd_GET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc)
 // ---- *PING 实现 ----
 void cmd_PING(void)
 {
-    char buf[PROTO_MAX_FRAME_LEN];
+    static char buf[PROTO_MAX_FRAME_LEN];
     sprintf(buf, "*PONG %lu", systick_count / SYSTICK_FREQUENCY);
     respond(buf);
 }
 
 // ---- 主动上报函数 ----
-void evt_send_edit(const char *type, const char *value)
-{
-    static char buf[PROTO_MAX_FRAME_LEN];
+void evt_send_edit(const char *type, const char *value){
+    char buf[PROTO_MAX_FRAME_LEN];
     sprintf(buf, "*EVT:EDIT %s %s", type, value);
     respond(buf);
 }
 
-void evt_send_disp(void)
-{
-	static char buf[PROTO_MAX_FRAME_LEN];
-	sprintf(buf, "*EVT:DISP %s %02X", seg_disp_buf, seg_disp_dp);
+void evt_send_disp(void){
+	char tmp[DISP_LEN+1];
+	char buf[PROTO_MAX_FRAME_LEN];
+	memcpy(tmp, seg_disp_buf, DISP_LEN);
+	tmp[DISP_LEN] = 0;
+	sprintf(buf, "*EVT:DISP %s %02X", tmp, seg_disp_dp);
     respond(buf);
 }
 
-void evt_send_led(void)
-{
+void evt_send_led(void){
     uint32_t val = I2C0_ReadByte(PCA9557_I2CADDR, PCA9557_INPUT);
     uint8_t led_val = (uint8_t)((~val) & 0xFF);
     char buf[PROTO_MAX_FRAME_LEN];
@@ -1007,25 +1053,21 @@ void evt_send_led(void)
     respond(buf);
 }
 
-void evt_send_key(const char *name)
-{
+void evt_send_key(const char *name){
     char buf[PROTO_MAX_FRAME_LEN];
     sprintf(buf, "*EVT:KEY %s", name);
     respond(buf);
 }
 
-void evt_send_alarm(void)
-{
+void evt_send_alarm(void){
     respond("*EVT:ALARM");
 }
 
-void evt_send_alarm_off(void)
-{
+void evt_send_alarm_off(void){
     respond("*EVT:ALARM_OFF");
 }
 
-void evt_send_mode(const char *state)
-{
+void evt_send_mode(const char *state){
     char buf[PROTO_MAX_FRAME_LEN];
     sprintf(buf, "*EVT:MODE %s", state);
     respond(buf);
@@ -1091,8 +1133,7 @@ void Buzzer_Toggle(void)
 
 /* ========================= I2C function ================================== */
 
-void S800_I2C0_Init(void)
-{
+void S800_I2C0_Init(void){
 	uint8_t result;
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_I2C0);
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
@@ -1115,8 +1156,7 @@ void S800_I2C0_Init(void)
 	
 }
 
-uint8_t I2C0_WriteByte(uint8_t DevAddr, uint8_t RegAddr, uint8_t WriteData)
-{
+uint8_t I2C0_WriteByte(uint8_t DevAddr, uint8_t RegAddr, uint8_t WriteData){
 	uint8_t rop;
 	while(I2CMasterBusy(I2C0_BASE)){};
 	I2CMasterSlaveAddrSet(I2C0_BASE, DevAddr, false);
@@ -1162,7 +1202,8 @@ void led_on(uint8_t bitmap){
 
 /* ========================= 七段数码管显示 ================================== */
 
-static char to_seg7(const char ch){
+static char to_seg7(char ch){
+	ch = toupper(ch);
 	if(ch>='0' && ch<='9'){
 		return seg7_digit[ch-'0'];
 	}
@@ -1181,35 +1222,20 @@ void seg_write(uint8_t pos, uint8_t value){
 }
 
 // 更新显示缓存区
-void seg_set_display(const char* str){
-	int i = 0, j = 0;
+void set_seg_disp_from_string(const char* str){
+	uint32_t tmp_dp;
+	char tmp_buf[DISP_LEN+1] = {0};
+
 	seg_clear();
+	extract_dots(str, tmp_buf, &tmp_dp);
+	seg_disp_dp = (uint8_t)tmp_dp;
+	strncpy(seg_disp_buf, tmp_buf, DISP_LEN);
+}
 
-    while(i < DISP_LEN && str[j] != '\0'){
-
-        char c = toupper(str[j]);
-		j++;
-
-        if(c == '.'){
-            if(i > 0){
-                seg_disp_dp |= (uint8_t)(1<<i-1);
-            }
-            continue;
-        }
-
-		
-        if((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c=='_' || c=='-' || c=='°'){
-            seg_disp_buf[i] = c;
-        }else{
-            seg_disp_buf[i] = 0x00;
-        }
-
-		i++;
-    }
-
-    while(i < DISP_LEN){
-        seg_disp_buf[i++] = 0x00;
-    }
+void set_seg_disp(const char* str, const uint8_t dp){
+	seg_clear();
+	seg_disp_dp = dp;
+	strncpy(seg_disp_buf, str, DISP_LEN);
 }
 
 void seg_clear(void){
@@ -1228,16 +1254,16 @@ void seg_refresh(void)				// 数码管刷新任务
 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2, (uint8_t)0x00);
 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT1, (uint8_t)c);			
 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2, (uint8_t)(1<<seg_display_pos));
-	seg_display_pos = (seg_display_pos + 1) % 8;
+	seg_display_pos = (seg_display_pos + 1) % DISP_LEN;
 }
 
 void boot_display(void) {
-    static uint8_t boot_step = 0;
     int i;
 
     switch(boot_step) {
         case 0: // 1. 8位数码管+8位LED全亮
-			memset(seg_disp_buf, 0xFF, DISP_LEN);
+			memset(seg_disp_buf, '8', DISP_LEN);
+			seg_disp_dp = 0xFF;
             led_on(0xFF);
             break;
             
@@ -1247,7 +1273,7 @@ void boot_display(void) {
             break;
             
         case 2: // 2. 显示学号后8位，LED同步闪烁（亮）
-            seg_set_display(MY_STUDENT_ID);
+            set_seg_disp_from_string(MY_STUDENT_ID);
             led_on(0xFF);
             break;
             
@@ -1257,7 +1283,7 @@ void boot_display(void) {
             break;
             
         case 4: // 3. 显示姓名拼音
-            seg_set_display(MY_NAME);
+            set_seg_disp_from_string(MY_NAME);
 			led_on(0xFF);
             break;
             
@@ -1267,7 +1293,7 @@ void boot_display(void) {
             break;
             
         case 6: // 4. 显示软件版本号
-            seg_set_display(FW_VERSION);
+            set_seg_disp_from_string(FW_VERSION);
 			led_on(0xFF);
             break;
             
@@ -1288,14 +1314,66 @@ void boot_display(void) {
     }
 }
 
+/* ---------- 流水显示 ---------- */
+void disp_user_msg(void){
+	if(!user_msg_active){
+		return;
+	}else{
+		int msg_len = strlen(user_msg);
+		if(msg_len < DISP_LEN){
+			if(systick_count - last_msg_scroll_tick >= 2000){
+				system_mode = temp_mode;
+				user_msg_active = 0;
+				msg_scroll_offset = 0;	
+				return;
+			}
+		}else{
+			if(systick_count - last_msg_scroll_tick >= scroll_speed){		
+				int i;
+				int pos;		
+				last_msg_scroll_tick = systick_count;
+				msg_scroll_offset++;
+
+				if (msg_scroll_offset >= msg_len) {
+					system_mode = temp_mode;
+					user_msg_active = 0;
+					msg_scroll_offset = 0;	
+					return;
+				}
+
+				seg_clear();
+
+				switch(display_format){
+					
+					case FORMAT_LEFT:
+						set_seg_disp(user_msg + msg_scroll_offset, (uint8_t)(user_dp >> msg_scroll_offset));
+						break;
+					case FORMAT_RIGHT:
+						for(i = 0; i < DISP_LEN; i++){
+							pos = msg_len - 1 - i - msg_scroll_offset;
+							if(pos < 0) continue;
+							seg_disp_buf[i] = user_msg[pos];						
+							if(pos > 0){
+								if((user_dp & (1<<(pos-1))) != 0){
+									seg_disp_dp |= (1<<i);
+								}
+							}
+						}
+						break;
+					default:
+						break;
+				}
+			}
+		}
+	}
+}
+
 /* ========================= 电子时钟功能代码 ================================== */
 
-bool date_equal(date_t date1, date_t date2)
-{
+bool date_equal(date_t date1, date_t date2){
     return (date1.year == date2.year) && (date1.month == date2.month) && (date1.day == date2.day);
 }
-bool time_equal(time_t time1, time_t time2)
-{
+bool time_equal(time_t time1, time_t time2){
     return (time1.hour == time2.hour) && (time1.min == time2.min) && (time1.sec == time2.sec);
 }
 
@@ -1415,19 +1493,19 @@ void add_sys_year(void) {
 void show_time(void){
 	char buf[16];
 	sprintf(buf, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
-	seg_set_display(buf);
+	set_seg_disp_from_string(buf);
 }
 
 void show_date_1(void){
 	char buf[16];
 	sprintf(buf, "%02d.%02d.%02d", system_date.year%100, system_date.month, system_date.day);
-	seg_set_display(buf);
+	set_seg_disp_from_string(buf);
 }
 
 void show_date_2(void){
 	char buf[16];
 	sprintf(buf, "%04d.%02d.%02d", system_date.year, system_date.month, system_date.day);
-	seg_set_display(buf);
+	set_seg_disp_from_string(buf);
 }
 
 void alarm(void){
@@ -1456,16 +1534,18 @@ bool key_queue_full(void)
     return ((key_queue_tail + 1) % KEY_QUEUE_SIZE == key_queue_head);
 }
 
-uint8_t key_push(KEY_EVENT ev){
+uint8_t key_push(KEY_EVENT ev)
+{
 	uint8_t next = (key_queue_tail + 1) % KEY_QUEUE_SIZE;
-   
-	if(next == key_queue_head) {
-        return (uint8_t)-1; //队列已满，返回-1
-    }
 
-    key_queue[key_queue_tail] = ev;
-    key_queue_tail = next;
-    return (key_queue_tail - 1) % KEY_QUEUE_SIZE;  // 返回插入元素的下标
+	if (next == key_queue_head)
+	{
+		return (uint8_t)-1; // 队列已满，返回-1
+	}
+
+	key_queue[key_queue_tail] = ev;
+	key_queue_tail = next;
+	return (key_queue_tail - 1) % KEY_QUEUE_SIZE; // 返回插入元素的下标
 }
 
 KEY_EVENT *key_pop(void){
@@ -1588,7 +1668,7 @@ void KEY_FUNC_Cb(KEY_EVENT ev)
 				setting_timeout_timer = systick_count;
 
 				sprintf(str, "%04d.%02d.%02d", temp_date.year, temp_date.month, temp_date.day);
-				seg_set_display(str);
+				set_seg_disp_from_string(str);
 				break;
 			}
 
@@ -1817,11 +1897,14 @@ void UART0_Handler(void)
 	{
 		char ch = UARTCharGetNonBlocking(UART0_BASE);
 		if(RxBufIndex < UART_BUFFER_SIZE - 1){
-			RxBuf[RxBufIndex++] = ch;
 			if (ch == '\r' || ch == '\n') {
-				RxBuf[RxBufIndex] = '\0';
-				RxBufIndex = 0;
-				RxEndFlag = 1;
+				if(RxBufIndex > 0){
+					RxBuf[RxBufIndex] = '\0';
+					RxBufIndex = 0;
+					RxEndFlag = 1;
+				}
+			}else{
+				RxBuf[RxBufIndex++] = ch;
 			}
 		} else {
 			RxBufIndex = 0;
@@ -1829,7 +1912,7 @@ void UART0_Handler(void)
 	}
 
 	if((ui32Status & UART_INT_RT)){
-		RxBuf[RxBufIndex] = '\0';
+		if(RxBufIndex > 0) RxBuf[RxBufIndex] = '\0';
 		RxBufIndex = 0;	
 		RxEndFlag = 1;
 	}
@@ -1897,7 +1980,7 @@ void add_cur_subitem(void){
         default:
             break;
     }
-	seg_set_display(str);
+	set_seg_disp_from_string(str);
 }
 
 void blink_cur_subitem(void){
@@ -1984,7 +2067,7 @@ void blink_cur_subitem(void){
 
 		blinker = !blinker;
 		last_blink_tick = systick_count;
-		seg_set_display(str);
+		set_seg_disp_from_string(str);
 	}
 }
 
@@ -2022,8 +2105,6 @@ int main(void)
 	volatile uint16_t i2c_flash_cnt,gpio_flash_cnt;
 
 	uint8_t i;		// for循环使用
-
-	char tmp[UART_BUFFER_SIZE];
 	
 	ui32SysClock = SysCtlClockFreqSet((SYSCTL_XTAL_16MHZ |SYSCTL_OSC_INT | SYSCTL_USE_PLL |SYSCTL_CFG_VCO_480), 20000000);
 	
@@ -2043,32 +2124,22 @@ int main(void)
 				add_sys_sec();
 			}
 
-			/* 用户消息 ≤8位: 静态显示 2秒后自动退出 */
-			if (user_msg_active && (int)strlen(user_msg) <= DISP_LEN) {
-				if (systick_count - last_msg_scroll_tick >= 2 * SYSTICK_FREQUENCY) {
-					user_msg_active = 0;
-					msg_scroll_offset = 0;
-				}
-			}
-
-			if (!user_msg_active) {
-				switch(system_mode){
-					case MODE_BOOT: 
-						boot_display();
-						break;
-					case MODE_SHOW_TIME: 
-						show_time(); 
-						break; 
-					case MODE_SHOW_DATE_1:
-						show_date_1();
-						break;
-					case MODE_SHOW_DATE_2:
-						show_date_2();
-						break;
-					case MODE_SETTING:
-						break;
-					default: break;
-				}
+			switch(system_mode){
+				case MODE_BOOT: 
+					boot_display();
+					break;
+				case MODE_SHOW_TIME: 
+					show_time(); 
+					break; 
+				case MODE_SHOW_DATE_1:
+					show_date_1();
+					break;
+				case MODE_SHOW_DATE_2:
+					show_date_2();
+					break;
+				case MODE_SETTING:
+					break;
+				default: break;
 			}
 
 			/* 数码管不亮时，显示也需更新缓存(为了心跳上报) */
@@ -2117,49 +2188,24 @@ int main(void)
 		if(flag_100ms == 1){
 			flag_100ms = 0;
 
-			/* >8位滚动消息：按scroll_speed速率滚动 */
-			if (user_msg_active && (int)strlen(user_msg) > DISP_LEN) {
-				int msg_len = (int)strlen(user_msg);
-				if (msg_len > 0) {
-					if (systick_count - last_msg_scroll_tick >= (uint32_t)(scroll_speed * SYSTICK_FREQUENCY / 1000)) {
-						char display_str[DISP_LEN + 1] = {0};
-						int j;
-						last_msg_scroll_tick = systick_count;
-						msg_scroll_offset++;
-						for (j = 0; j < DISP_LEN; j++) {
-							int pos;
-							if (display_format == FORMAT_LEFT) {
-								pos = (j + msg_scroll_offset) % msg_len;
-							} else {
-								pos = (msg_len - 1 - (j + msg_scroll_offset) % msg_len + msg_len) % msg_len;
-							}
-							display_str[j] = user_msg[pos];
-						}
-						display_str[DISP_LEN] = '\0';
-						seg_set_display(display_str);
-						/* 走完一遍后自动退出 */
-						if (msg_scroll_offset >= msg_len) {
-							user_msg_active = 0;
-							msg_scroll_offset = 0;
-						}
-					}
-				}
-			}
-
 			if(is_add_pressing == 1){
 				add_cur_subitem();
 			}
 		}
 
 		if(RxEndFlag == 1){
+			static char tmp[UART_BUFFER_SIZE];
 			RxEndFlag = 0;
 
 			strcpy(tmp, (const char *)RxBuf);
 			strtok(tmp, "\r\n");
 			process_command(tmp);
+			// UARTStringPutNonBlocking(tmp);
 		}
 
-
+		if(system_mode == MODE_SHOW_USER_MSG){
+			disp_user_msg();
+		}
 
 		blink_cur_subitem();
 		
@@ -2176,13 +2222,13 @@ int main(void)
 		// 			break;
 		// 		}
 		// 		case 2:
-		// 			seg_set_display(MY_STUDENT_ID);
+		// 			set_seg_disp_from_string(MY_STUDENT_ID);
 		// 			break;
 		// 		case 4:
-		// 			seg_set_display(MY_NAME);
+		// 			set_seg_disp_from_string(MY_NAME);
 		// 			break;
 		// 		case 6:
-		// 			seg_set_display(FW_VERSION);
+		// 			set_seg_disp_from_string(FW_VERSION);
 		// 			break;
 		// 		case 1: case 3: case 5: case 7:
 		// 			seg_clear();

@@ -136,6 +136,8 @@ $RECYCLE.BIN/
 # Logs
 *.log
 
+test/
+
 # ==================== Project Specific ====================
 # Any generated binaries or hex files
 *.bin
