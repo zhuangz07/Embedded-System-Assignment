@@ -259,6 +259,18 @@ void disp_user_msg(void);
 volatile uint32_t remote_beep_ms = 0;
 volatile uint32_t remote_beep_start_tick = 0;
 
+/* ---------- 天气显示 ---------- */
+typedef struct {
+	int8_t temperature;         // 温度值 (-99 ~ 99)
+	char condition[4];          // 天气码 (3位字母 + '\0')
+	uint8_t active;             // 是否激活天气显示
+	uint32_t start_tick;        // 开始显示时刻
+} weather_t;
+
+weather_t weather_info = {0, "", 0, 0};
+
+void show_weather(void);
+
 /* ================= 电子时钟 ================ */
 
 typedef struct{
@@ -352,8 +364,8 @@ KEY_EVENT key_queue[KEY_QUEUE_SIZE];
 volatile uint8_t key_queue_head;
 volatile uint8_t key_queue_tail;
 
-bool key_queue_empty(void);
-bool key_queue_full(void);
+static bool key_queue_empty(void);
+static bool key_queue_full(void);
 uint8_t key_push(KEY_EVENT ev);
 KEY_EVENT *key_pop(void);
 
@@ -401,7 +413,8 @@ typedef enum{
 	MODE_SHOW_DATE_1,
 	MODE_SHOW_DATE_2,
 	MODE_SETTING,
-	MODE_SHOW_USER_MSG
+	MODE_SHOW_USER_MSG,
+	MODE_SHOW_WEATHER
 } SYSTEM_MODE;		// 系统显示模式
 SYSTEM_MODE system_mode = MODE_BOOT;
 SYSTEM_MODE temp_mode = MODE_BOOT;		// 用于进入设置项/显示用户信息时，保存进入前的模式
@@ -990,7 +1003,7 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
         return;
     }
 
-    // ---- *SET:MODE (扩展) ----
+        // ---- *SET:MODE (扩展) ----
     if (match_abbr(type_str, "MODE")) {
 		char val[PROTO_MAX_FRAME_LEN/2];
         if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
@@ -1004,6 +1017,49 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
         } else {
             respond_error(ERROR_PARAM_STR);
         }
+        return;
+    }
+
+    // ---- *SET:WEA ----
+    if (match_abbr(type_str, "WEA")) {
+        int temp;
+        int i;
+        if (argc < 3) { respond_error(ERROR_PARAM_STR); return; }
+        
+        // 解析温度
+        temp = (int)strtol(args[1], NULL, 10);
+        if (temp < -99 || temp > 99) {
+            respond_error(ERROR_RANGE_STR);
+            return;
+        }
+        
+        // 解析天气码（必须是3位字母）
+        if (strlen(args[2]) != 3) {
+            respond_error(ERROR_PARAM_STR);
+            return;
+        }
+        for (i = 0; i < 3; i++) {
+            if (!((args[2][i] >= 'A' && args[2][i] <= 'Z') || 
+                  (args[2][i] >= 'a' && args[2][i] <= 'z'))) {
+                respond_error(ERROR_PARAM_STR);
+                return;
+            }
+        }
+        
+        // 保存天气信息
+        weather_info.temperature = (int8_t)temp;
+        strncpy(weather_info.condition, args[2], 3);
+        weather_info.condition[3] = '\0';
+        str_toupper(weather_info.condition);
+        
+        // 激活天气显示
+        temp_mode = system_mode;
+        system_mode = MODE_SHOW_WEATHER;
+        weather_info.active = 1;
+        weather_info.start_tick = systick_count;
+        
+        show_weather();
+        respond_ok();
         return;
     }
 
@@ -1243,7 +1299,7 @@ static char to_seg7(char ch){
 		return seg7_letter[ch-'A'];
 	}
 	if(ch=='-') return 0x40;
-	if(ch=='°') return 0x63;
+	if(ch=='*') return 0x63;
 	return 0x00;
 }
 
@@ -1575,8 +1631,19 @@ void show_date_2(void){
 	set_seg_disp_from_string(buf);
 }
 
+void show_weather(void){
+	char buf[16];
+	// 格式：(-)TT*C<COND>
+	if (weather_info.temperature < 0) {
+		sprintf(buf, "-%02d*C%s", -weather_info.temperature, weather_info.condition);
+	} else {
+		sprintf(buf, "_%02d*C%s", weather_info.temperature, weather_info.condition);
+	}
+	set_seg_disp_from_string(buf);
+}
+
 void alarm(void){
-    static uint8_t alarm_tick = 0;    
+    static uint8_t alarm_tick = 0;
 
 	if(alarm_tick >= 10){
 		Buzzer_Off();
@@ -1594,10 +1661,10 @@ void alarm(void){
 
 /* =========================== 按键处理 =============================== */
 
-bool key_queue_empty(void){
+static bool key_queue_empty(void){
     return (key_queue_head == key_queue_tail);
 }
-bool key_queue_full(void){
+static bool key_queue_full(void){
     return ((key_queue_tail + 1) % KEY_QUEUE_SIZE == key_queue_head);
 }
 
@@ -1616,8 +1683,8 @@ uint8_t key_push(KEY_EVENT ev){
 
 KEY_EVENT *key_pop(void){
 	KEY_EVENT *ev;
-	if(key_queue_head == key_queue_tail)
-		return NULL; // 队列为空
+	if(key_queue_empty())
+		return NULL;
 
     ev = &key_queue[key_queue_head];
     key_queue_head = (key_queue_head + 1) % KEY_QUEUE_SIZE;
@@ -1630,29 +1697,35 @@ KEY_EVENT *key_pop(void){
 				按下时间 >800ms 入队长按事件，否则入队短按事件
 `*/
 void key_scan(void){
-	static uint8_t raw;
-	static uint8_t last_raw;
+	static uint16_t raw;
+	static uint16_t last_raw = 0xFFFF;
 
-	static uint16_t key_pressed_time[8]; 
+	static uint16_t key_pressed_time[10]; 
 
 	uint8_t i;
 	KEY_EVENT ev;
 
-	raw = I2C0_ReadByte(TCA6424_I2CADDR, TCA6424_INPUT_PORT0);
-	for(i=0; i<8; i++){
-		uint8_t mask = (uint8_t)(1<<i);
+	uint8_t i2c_raw = I2C0_ReadByte(TCA6424_I2CADDR, TCA6424_INPUT_PORT0);
+	uint8_t gpio_raw = GPIOPinRead(GPIO_PORTJ_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+
+	raw = i2c_raw;
+    if(gpio_raw & GPIO_PIN_0) raw |= (1 << 8);
+    if(gpio_raw & GPIO_PIN_1) raw |= (1 << 9);
+
+	for(i=0; i<10; i++){
+		uint16_t mask = (uint16_t)(1<<i);
 		if((raw & mask) == 0)		// 按下 
 		{
 			if(key_pressed_time[i] < KEY_PRESS_TIME){
 				key_pressed_time[i] += SYSTICK_FREQUENCY / KEY_SCAN_FREQ;
-						}else if(key_pressed_time[i] != 0xFFFF){
+			}else if(key_pressed_time[i] != 0xFFFF){
 				ev.key = i+1;
 				ev.state = KEY_PRESS;
 				ev.source = ON_BORAD;
 				key_push(ev);
 				key_pressed_time[i] = 0xFFFF;
 			}
-		}else if((last_raw & mask) == 0){
+		}else if((last_raw & mask) == 0){	// 抬起
 			if(key_pressed_time[i] == 0xFFFF){
 				ev.key = i+1;
 				ev.state = KEY_PRESSUP;
@@ -1890,7 +1963,10 @@ void KEY_USER1_Cb(KEY_EVENT ev){
     // Implement KEY_USER1 handling logic here
 	switch (ev.state){
 		case KEY_TAP:
+			respond("*NTP SYNC");
+			break;
 		case KEY_PRESS:
+			break;
 		case KEY_PRESSUP:
 		case KEY_IDLE:
 		default:
@@ -2141,6 +2217,8 @@ void blink_cur_subitem(void){
 }
 
 void quit_setting(void){
+	if(system_mode != MODE_SETTING) return;
+
 	system_date = temp_date;
 	system_time = temp_time;
 	alarm_time 	= temp_alarm;
@@ -2171,8 +2249,7 @@ void quit_setting(void){
 
 /* =============== MAIN =============== */
 
-int main(void)
-{
+int main(void){
 	volatile uint16_t i2c_flash_cnt,gpio_flash_cnt;
 
 	uint8_t i;		// for循环使用
@@ -2237,6 +2314,22 @@ int main(void)
 				}
 			}
 
+			/* 天气显示超时检查（5秒） */
+			if (weather_info.active) {
+				uint32_t elapsed = (systick_count - weather_info.start_tick);
+				if (elapsed >= 5000) {
+					weather_info.active = 0;
+					system_mode = temp_mode;
+					// 恢复原模式显示
+					switch(system_mode) {
+						case MODE_SHOW_TIME: show_time(); break;
+						case MODE_SHOW_DATE_1: show_date_1(); break;
+						case MODE_SHOW_DATE_2: show_date_2(); break;
+						default: break;
+					}
+				}
+			}
+
 			/* 1秒心跳：*EVT:DISP 和 *EVT:LED */
 			evt_send_disp();
 			evt_send_led();
@@ -2284,10 +2377,33 @@ int main(void)
 			flag_500ms = 0;
 			if(system_mode != MODE_BOOT){
 				if(set_led_activate == 0){
-				led_bitmap ^= 0x01;
+					led_bitmap ^= 0x01;
+				
+					/* 天气相关 LED 控制 */
+					if (weather_info.active) {
+						// LED4 (bit3): SUN 时常亮
+						if (strcmp(weather_info.condition, "SUN") == 0) {
+							led_bitmap |= (1<<3);
+						}else{
+							led_bitmap &= ~(1<<3);
+						}
+						// LED5 (bit4): RAI/SNO 时 1Hz 呼吸(500ms翻转)
+						if (strcmp(weather_info.condition, "RAI") == 0 || 
+							strcmp(weather_info.condition, "SNO") == 0) {
+							led_bitmap ^= (1<<4);
+						}else{
+							led_bitmap &= (1<<4);
+						}
+						// LED6 (bit5): ≥30*C 时常亮
+						if (weather_info.temperature >= 30) {
+							led_bitmap |= (1<<5);
+						}else{
+							led_bitmap &= (1<<5);
+						}
+					}
+				}
 			}
-			}
-			
+		
 		}
 
 		if(RxEndFlag == 1){

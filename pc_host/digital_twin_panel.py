@@ -18,12 +18,12 @@ class SevenSegmentDisplay(QWidget):
         '8': 0b01111111, '9': 0b01101111,
         'A': 0b01110111, 'B': 0b01111100, 'C': 0b00111001, 'D': 0b01011110,
         'E': 0b01111001, 'F': 0b01110001, 'G': 0b00111101, 'H': 0b01110110,
-        'I': 0b00000110, 'J': 0b00011110, 'K': 0b01110110, 'L': 0b00111000,
-        'M': 0b00010101, 'N': 0b01010100, 'O': 0b00111111, 'P': 0b01110011,
-        'Q': 0b01100111, 'R': 0b01010000, 'S': 0b01101101, 'T': 0b01111000,
-        'U': 0b00111110, 'V': 0b00111110, 'W': 0b00101010, 'X': 0b01110110,
-        'Y': 0b01101110, 'Z': 0b01011011,
-        ' ': 0b00000000, '-': 0b01000000, '_': 0b00000000, '=': 0b01001000,
+        'I': 0b00000110, 'J': 0b00011110, 'K': 0b01110101, 'L': 0b00111100,
+        'M': 0b01010101, 'N': 0b00110111, 'O': 0b00111111, 'P': 0b01110011,
+        'Q': 0b01100111, 'R': 0b01110000, 'S': 0b01101101, 'T': 0b01111000,
+        'U': 0b00111110, 'V': 0b01111110, 'W': 0b01101010, 'X': 0b00110110,
+        'Y': 0b01101110, 'Z': 0b01001001,
+        ' ': 0b00000000, '-': 0b01000000, '_': 0b00000000, '°': 0b01100011,
     }
     
     def __init__(self, parent=None):
@@ -163,7 +163,6 @@ class DigitalTwinPanel(QWidget):
         super().__init__(parent)
         
         # 状态
-        self.night_mode = False
         self.display_on = True
         
         # 初始化UI
@@ -319,14 +318,8 @@ class DigitalTwinPanel(QWidget):
         for i in range(8):
             char = text[i]
             dp = bool(dp_hex & (1 << i))
-            
-            # 昼夜模式：NIGHT时只显示前4位（时分）
-            if self.night_mode and i >= 4:
-                self.segments[i].set_char(' ', False)
-                self.segments[i].set_on(False)
-            else:
-                self.segments[i].set_char(char, dp)
-                self.segments[i].set_on(self.display_on)
+            self.segments[i].set_char(char, dp)
+            self.segments[i].set_on(self.display_on)
     
     def update_leds(self, led_byte: int):
         """
@@ -337,18 +330,11 @@ class DigitalTwinPanel(QWidget):
         """
         for i in range(8):
             is_on = bool(led_byte & (1 << i))
-            
-            # 昼夜模式：NIGHT时只保留心跳LED（假设LED0是心跳）
-            if self.night_mode and i > 0:
-                self.leds[i].set_on(False)
-            else:
-                self.leds[i].set_on(is_on)
+            self.leds[i].set_on(is_on)
     
     def set_night_mode(self, night: bool):
-        """设置昼夜模式"""
-        self.night_mode = night
-        # 强制刷新显示
-        self.update()
+        """昼夜模式由下位机控制，上位机仅作记录，不影响显示"""
+        pass
     
     def set_display_on(self, on: bool):
         """设置显示开关"""

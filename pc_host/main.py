@@ -3,11 +3,13 @@
 实现与S800板的串口通信、数字孪生镜像、扩展功能等
 """
 
+import re
 import sys
 import time
 from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog
 from PyQt5.QtCore import QTimer
 from datetime import datetime
+import ntplib
 import requests
 
 from ui_mainwindow import MainWindow
@@ -216,9 +218,11 @@ class ClockSystemApp:
             key_name = event_data
             self.window.append_log(f"按键按下: {key_name}", 'event')
             
-            # 特殊处理USER1 - 自动触发NTP对时
-            if key_name == 'USER1':
-                self.on_ntp_sync()
+            # # 特殊处理USER1 - 自动触发NTP对时
+            # if key_name == 'USER1':
+            #     self.on_ntp_sync()
+            # elif key_name == 'USER2':
+            #     self.on_get_weather()
             
         elif event_type == 'DISP':
             # 显示变化事件
@@ -363,58 +367,83 @@ class ClockSystemApp:
         try:
             self.window.append_log("正在从NTP服务器获取时间...", 'info')
             
-            # 使用worldtimeapi获取时间
-            response = requests.get('http://worldtimeapi.org/api/timezone/Asia/Shanghai', timeout=5)
+            dt = None
+            errors = []
             
-            if response.status_code == 200:
-                data = response.json()
-                dt_str = data['datetime']
-                
-                # 解析ISO格式时间
-                dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
-                
-                # 发送时间到S800板
-                date_cmd = CommandBuilder.set_date(dt.year, dt.month, dt.day)
-                time_cmd = CommandBuilder.set_time(dt.hour, dt.minute, dt.second)
-                
-                self.send_command(date_cmd)
-                time.sleep(0.1)
-                self.send_command(time_cmd)
-                
-                self.window.ntp_status.setText(f"状态: 对时成功 {dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                self.window.ntp_status.setStyleSheet("color: green;")
-                self.window.append_log(f"NTP对时成功: {dt.strftime('%Y-%m-%d %H:%M:%S')}", 'info')
-                
-                QMessageBox.information(self.window, "成功", f"NTP对时成功\n{dt.strftime('%Y-%m-%d %H:%M:%S')}")
-            else:
-                raise Exception("NTP服务器响应错误")
+            # 主源：ntplib 直接走 NTP UDP 协议，访问阿里云 NTP
+            try:
+                c = ntplib.NTPClient()
+                ntp_resp = c.request('ntp.aliyun.com', version=3)
+                dt = datetime.fromtimestamp(ntp_resp.tx_time)
+                self.window.append_log("NTP源: ntp.aliyun.com", 'info')
+            except Exception as e:
+                errors.append(f"ntplib: {e}")
+            
+            # 备用：本机系统时间
+            if dt is None:
+                dt = datetime.now()
+                self.window.append_log(
+                    f"警告：网络时源不可用（{'; '.join(errors)}），使用本机系统时间", 'error'
+                )
+            
+            # 发送时间到 S800 板
+            date_cmd = CommandBuilder.set_date(dt.year, dt.month, dt.day)
+            time_cmd = CommandBuilder.set_time(dt.hour, dt.minute, dt.second)
+            
+            self.send_command(date_cmd)
+            time.sleep(0.1)
+            self.send_command(time_cmd)
+            
+            self.window.ntp_status.setText(f"状态: 对时成功 {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.window.ntp_status.setStyleSheet("color: green;")
+            self.window.append_log(f"NTP对时成功: {dt.strftime('%Y-%m-%d %H:%M:%S')}", 'info')
+            
+            QMessageBox.information(self.window, "成功", f"NTP对时成功\n{dt.strftime('%Y-%m-%d %H:%M:%S')}")
                 
         except Exception as e:
-            self.window.ntp_status.setText(f"状态: 对时失败")
+            self.window.ntp_status.setText("状态: 对时失败")
             self.window.ntp_status.setStyleSheet("color: red;")
             self.window.append_log(f"NTP对时失败: {str(e)}", 'error')
             QMessageBox.warning(self.window, "错误", f"NTP对时失败: {str(e)}")
     
+    @staticmethod
+    def _parse_weather(raw: str):
+        """解析 wttr.in 天气字符串，返回 (temp: int, cond_code: str)"""
+        m = re.search(r'([+-]?\d+)\s*°?C', raw)
+        temp = int(m.group(1)) if m else 0
+        desc = re.sub(r'[+-]?\d+\s*°?C', '', raw).strip().lower()
+        _MAP = [
+            ('SNO', ['snow', 'sleet', 'blizzard', 'hail']),
+            ('RAI', ['rain', 'drizzle', 'shower', 'thunder', 'storm']),
+            ('FOG', ['fog', 'mist', 'haze', 'smoke', 'smoky', 'smog', 'dust', 'sand', 'ash']),
+            ('OVC', ['overcast']),
+            ('CLD', ['cloud', 'partly', 'mostly', 'broken', 'scattered']),
+            ('SUN', ['sun', 'clear', 'fair', 'bright']),
+        ]
+        for code, words in _MAP:
+            if any(w in desc for w in words):
+                return temp, code
+        return temp, 'OTH'
+
     def on_get_weather(self):
         """获取天气 (E2)"""
         try:
             self.window.append_log("正在获取天气信息...", 'info')
             
-            # 使用wttr.in获取天气（简单的文本API）
             response = requests.get('http://wttr.in/Shanghai?format=%t+%C', timeout=5)
             
             if response.status_code == 200:
                 weather_text = response.text.strip()
+                temp, cond = self._parse_weather(weather_text)
                 
-                # 发送天气消息到S800板
-                msg_cmd = CommandBuilder.set_message(f"Weather: {weather_text}")
-                self.send_command(msg_cmd)
+                wea_cmd = f"*SET:WEA {temp:02d} {cond}"
+                self.send_command(wea_cmd)
                 
-                self.window.weather_status.setText(f"状态: {weather_text}")
+                self.window.weather_status.setText(f"状态: {weather_text} → {cond}")
                 self.window.weather_status.setStyleSheet("color: green;")
-                self.window.append_log(f"天气获取成功: {weather_text}", 'info')
+                self.window.append_log(f"天气获取成功: {weather_text} → T={temp:02d} COND={cond}", 'info')
                 
-                QMessageBox.information(self.window, "成功", f"天气: {weather_text}")
+                QMessageBox.information(self.window, "成功", f"天气: {weather_text}\n发送: {wea_cmd}")
             else:
                 raise Exception("天气服务响应错误")
                 
@@ -451,6 +480,10 @@ class ClockSystemApp:
         cmd = CommandBuilder.set_key(key_name)
         self.send_command(cmd)
         self.window.append_log(f"虚拟按键: {key_name}", 'send')
+        if key_name == 'USER1':
+            self.on_ntp_sync()
+        elif key_name == 'USER2':
+            self.on_get_weather()
     
     def on_export_log(self):
         """导出日志"""
