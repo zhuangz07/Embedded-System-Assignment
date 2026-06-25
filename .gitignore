@@ -136,10 +136,12 @@ $RECYCLE.BIN/
 # Logs
 *.log
 
-test/
-大作业题.md
-
 # ==================== Project Specific ====================
 # Any generated binaries or hex files
 *.bin
 *.hex
+
+test/
+*.lnk
+*.md
+!README.md

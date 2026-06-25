@@ -75,7 +75,7 @@
 uint32_t ui32SysClock;	//系统时钟频率
 
 volatile uint32_t systick_count;
-volatile uint8_t flag_1ms, flag_2ms, flag_10ms, flag_100ms, flag_1s;
+volatile uint8_t flag_1ms, flag_2ms, flag_10ms, flag_100ms, flag_500ms, flag_1s;
 
 void delay_ms(uint32_t value);
 void Delay(uint32_t value)
@@ -104,6 +104,11 @@ void Buzzer_Toggle(void);
 char TxBuf[UART_BUFFER_SIZE] = {0};
 volatile char RxBuf[UART_BUFFER_SIZE] = {0};
 volatile uint8_t RxEndFlag = 0;
+
+/* UART 活动指示：收发时 LED 第4位以 100ms 频率闪烁 */
+volatile uint8_t uart_active = 0;
+volatile uint32_t uart_last_active_tick = 0;
+#define UART_ACTIVE_TIMEOUT  200   // ms，无收发活动后熄灭
 
 void S800_UART_Init(void);
 void UARTStringPut(const char *cMessage);
@@ -153,6 +158,14 @@ void S800_I2C0_Init(void);
 uint8_t I2C0_WriteByte(uint8_t DevAddr, uint8_t RegAddr, uint8_t WriteData);
 uint32_t I2C0_ReadByte(uint8_t DevAddr, uint8_t RegAddr);
 
+/* 当前 LED 状态缓存 */
+uint8_t led_bitmap = 0x00;
+uint8_t last_led_bitmap = 0x00;
+
+uint8_t set_led_activate = 0;
+uint32_t last_set_led_time = 0;
+
+void led_refresh(void);
 void led_on(uint8_t bitmap);
 
 /* ==================== 数码管 ==================== */
@@ -206,9 +219,11 @@ const uint8_t seg7_letter[] = {
 };
 
 static char to_seg7(const char ch);
+static char seg_blank_char(char ch);
+static uint8_t reverse_dp(uint32_t dp, uint8_t len, uint8_t offset);
 
 // 数码管显示内容缓存
-uint8_t seg_disp_buf[DISP_LEN] = {0};
+uint8_t seg_disp_buf[DISP_LEN+1] = {0};
 uint8_t seg_disp_dp = 0;
 
 void seg_write(uint8_t pos, uint8_t value);
@@ -447,6 +462,10 @@ void UARTStringPut(const char *cMessage){
 }
 
 void UARTStringPutNonBlocking(const unsigned char *msg){
+	if (*msg != '\0') {
+		uart_active = 1;
+		uart_last_active_tick = systick_count;
+	}
 	while(*msg != '\0') {
 		if (UARTSpaceAvail(UART0_BASE)) //发送FIFO有空位
 			UARTCharPutNonBlocking(UART0_BASE, *msg++); //发送一个字符
@@ -922,11 +941,18 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
         return;
     }
 
-    // ---- *SET:LED ----
+        // ---- *SET:LED ----
     if (match_abbr(type_str, "LED")) {
-		uint8_t val = (uint8_t)strtol(args[1], NULL, 16);
+        uint8_t val;
         if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
+        val = (uint8_t)strtol(args[1], NULL, 16);
         led_on(val);
+        if (val == 0x00) {
+            set_led_activate = 0;
+        } else {
+            set_led_activate = 1;
+            last_set_led_time = systick_count;
+        }
         respond_ok();
         return;
     }
@@ -996,34 +1022,39 @@ void cmd_GET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
 
     strncpy(type_str, args[0], sizeof(type_str) - 1);
     str_toupper(type_str);
+    {
+        bool reverse_response = false;
 
-    if (match_abbr(type_str, "DATE")) {
-        sprintf(data, "%04d.%02d.%02d", system_date.year, system_date.month, system_date.day);
-    } else if (match_abbr(type_str, "TIME")) {
-        sprintf(data, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
-    } else if (match_abbr(type_str, "ALARM")) {
-        sprintf(data, "%02d.%02d.%02d", alarm_time.hour, alarm_time.min, alarm_time.sec);
-    } else if (match_abbr(type_str, "DISP")) {
-        strcpy(data, display_on ? "ON" : "OFF");
-    } else if (match_abbr(type_str, "FORMAT")) {
-        strcpy(data, (display_format == FORMAT_LEFT) ? "LEFT" : "RIGHT");
-    } else {
-        respond_error(ERROR_SYNTAX_STR);
-        return;
-    }
+        if (match_abbr(type_str, "DATE")) {
+            sprintf(data, "%04d.%02d.%02d", system_date.year, system_date.month, system_date.day);
+            reverse_response = true;
+        } else if (match_abbr(type_str, "TIME")) {
+            sprintf(data, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
+            reverse_response = true;
+        } else if (match_abbr(type_str, "ALARM")) {
+            sprintf(data, "%02d.%02d.%02d", alarm_time.hour, alarm_time.min, alarm_time.sec);
+            reverse_response = true;
+        } else if (match_abbr(type_str, "DISP")) {
+            strcpy(data, display_on ? "ON" : "OFF");
+        } else if (match_abbr(type_str, "FORMAT")) {
+            strcpy(data, (display_format == FORMAT_LEFT) ? "LEFT" : "RIGHT");
+        } else {
+            respond_error(ERROR_SYNTAX_STR);
+            return;
+        }
 
-    if (display_format == FORMAT_RIGHT) {
-        char rev[PROTO_MAX_FRAME_LEN];
-        str_reverse(rev, data);
-        respond_ok_data(rev);
-    } else {
-        respond_ok_data(data);
+        if (display_format == FORMAT_RIGHT && reverse_response) {
+            char rev[PROTO_MAX_FRAME_LEN];
+            str_reverse(rev, data);
+            respond_ok_data(rev);
+        } else {
+            respond_ok_data(data);
+        }
     }
 }
 
 // ---- *PING 实现 ----
-void cmd_PING(void)
-{
+void cmd_PING(void){
     static char buf[PROTO_MAX_FRAME_LEN];
     sprintf(buf, "*PONG %lu", systick_count / SYSTICK_FREQUENCY);
     respond(buf);
@@ -1046,10 +1077,8 @@ void evt_send_disp(void){
 }
 
 void evt_send_led(void){
-    uint32_t val = I2C0_ReadByte(PCA9557_I2CADDR, PCA9557_INPUT);
-    uint8_t led_val = (uint8_t)((~val) & 0xFF);
     char buf[PROTO_MAX_FRAME_LEN];
-    sprintf(buf, "*EVT:LED %02X", led_val);
+    sprintf(buf, "*EVT:LED %02X", led_bitmap);
     respond(buf);
 }
 
@@ -1075,8 +1104,7 @@ void evt_send_mode(const char *state){
 
 /* ========================= GPIO function ================================== */
 
-void S800_GPIO_Init(void)
-{
+void S800_GPIO_Init(void){
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);						//Enable PortF
 	while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOF));			//Wait for the GPIO moduleF ready
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOJ);						//Enable PortJ	
@@ -1100,8 +1128,7 @@ void S800_GPIO_Init(void)
 
 /* ========================= PWM function ================================== */
 
-void S800_PWM_Init(void)
-{
+void S800_PWM_Init(void){
 	pwm_period = ui32SysClock / BUZZER_FREQ;
     PWMClockSet(PWM0_BASE, PWM_SYSCLK_DIV_1);
     PWMGenConfigure(PWM0_BASE, PWM_GEN_3, PWM_GEN_MODE_DOWN | PWM_GEN_MODE_NO_SYNC);
@@ -1113,20 +1140,17 @@ void S800_PWM_Init(void)
     PWMGenEnable(PWM0_BASE, PWM_GEN_3);
 }
 
-void Buzzer_On(void)
-{
+void Buzzer_On(void){
     PWMOutputState(PWM0_BASE, PWM_OUT_7_BIT, true);
 	buzzer_state = true;
 }
 
-void Buzzer_Off(void)
-{
+void Buzzer_Off(void){
     PWMOutputState(PWM0_BASE, PWM_OUT_7_BIT, false);
 	buzzer_state = false;
 }
 
-void Buzzer_Toggle(void)
-{
+void Buzzer_Toggle(void){
     buzzer_state = !buzzer_state;
     PWMOutputState(PWM0_BASE, PWM_OUT_7_BIT, buzzer_state);
 }
@@ -1197,7 +1221,15 @@ uint32_t I2C0_ReadByte(uint8_t DevAddr, uint8_t RegAddr){
 }
 
 void led_on(uint8_t bitmap){
-	I2C0_WriteByte(PCA9557_I2CADDR, PCA9557_OUTPUT, ~bitmap);
+	led_bitmap = bitmap;
+	// I2C0_WriteByte(PCA9557_I2CADDR, PCA9557_OUTPUT, ~bitmap);
+}
+
+void led_refresh(void){
+	if(led_bitmap != last_led_bitmap){
+		I2C0_WriteByte(PCA9557_I2CADDR, PCA9557_OUTPUT, ~led_bitmap);
+		last_led_bitmap = led_bitmap;
+	}
 }
 
 /* ========================= 七段数码管显示 ================================== */
@@ -1211,9 +1243,27 @@ static char to_seg7(char ch){
 		return seg7_letter[ch-'A'];
 	}
 	if(ch=='-') return 0x40;
-	if(ch=='_') return 0x08;
 	if(ch=='°') return 0x63;
 	return 0x00;
+}
+
+static char seg_blank_char(char ch){
+	return (ch == ' ' || ch == '\0') ? '_' : ch;
+}
+
+static uint8_t reverse_dp(uint32_t dp, uint8_t len, uint8_t offset){
+	uint8_t ret = 0;
+	uint8_t i;
+
+	for(i = 0; i < len; i++){
+		if((dp & (1u << i)) != 0u){
+			if(i < (uint8_t)(len - 1)){
+				ret |= (uint8_t)(1u << (offset + len - 2 - i));
+			}
+		}
+	}
+
+	return ret;
 }
 
 void seg_write(uint8_t pos, uint8_t value){
@@ -1224,22 +1274,39 @@ void seg_write(uint8_t pos, uint8_t value){
 // 更新显示缓存区
 void set_seg_disp_from_string(const char* str){
 	uint32_t tmp_dp;
-	char tmp_buf[DISP_LEN+1] = {0};
+	char tmp_buf[PROTO_MSG_MAX_LEN+1] = {0};
 
-	seg_clear();
 	extract_dots(str, tmp_buf, &tmp_dp);
-	seg_disp_dp = (uint8_t)tmp_dp;
-	strncpy(seg_disp_buf, tmp_buf, DISP_LEN);
+	set_seg_disp(tmp_buf, (uint8_t)tmp_dp);
 }
 
 void set_seg_disp(const char* str, const uint8_t dp){
+	uint8_t len;
+	uint8_t i;
+
 	seg_clear();
-	seg_disp_dp = dp;
-	strncpy(seg_disp_buf, str, DISP_LEN);
+	len = (uint8_t)strlen(str);
+	if(len > DISP_LEN){
+		len = DISP_LEN;
+	}
+
+	if(display_format == FORMAT_RIGHT){
+		uint8_t offset = DISP_LEN - len;
+		seg_disp_dp = reverse_dp(dp, len, offset);
+		for(i = 0; i < len; i++){
+			seg_disp_buf[offset + i] = seg_blank_char(str[len - 1 - i]);
+		}
+	}else{
+		seg_disp_dp = (uint8_t)(dp & 0xFFu);
+		for(i = 0; i < len; i++){
+			seg_disp_buf[i] = seg_blank_char(str[i]);
+		}
+	}
 }
 
 void seg_clear(void){
-	memset(seg_disp_buf, 0, sizeof(seg_disp_buf));
+	memset(seg_disp_buf, '_', DISP_LEN);
+	seg_disp_buf[DISP_LEN] = '\0';
 	seg_disp_dp = 0;
 }
 
@@ -1318,9 +1385,9 @@ void boot_display(void) {
 void disp_user_msg(void){
 	if(!user_msg_active){
 		return;
-	}else{
+		}else{
 		int msg_len = strlen(user_msg);
-		if(msg_len < DISP_LEN){
+		if(msg_len <= DISP_LEN){
 			if(systick_count - last_msg_scroll_tick >= 2000){
 				system_mode = temp_mode;
 				user_msg_active = 0;
@@ -1513,11 +1580,13 @@ void alarm(void){
 
 	if(alarm_tick >= 10){
 		Buzzer_Off();
+		led_bitmap &= ~(1<<1);
 		alarming = 0;
 		alarm_tick = 0;
 		evt_send_alarm_off();
 	}else{
 		Buzzer_Toggle();
+		led_bitmap ^= (1<<1);
 		alarm_tick++;
 	}
 }
@@ -1525,17 +1594,14 @@ void alarm(void){
 
 /* =========================== 按键处理 =============================== */
 
-bool key_queue_empty(void)
-{
+bool key_queue_empty(void){
     return (key_queue_head == key_queue_tail);
 }
-bool key_queue_full(void)
-{
+bool key_queue_full(void){
     return ((key_queue_tail + 1) % KEY_QUEUE_SIZE == key_queue_head);
 }
 
-uint8_t key_push(KEY_EVENT ev)
-{
+uint8_t key_push(KEY_EVENT ev){
 	uint8_t next = (key_queue_tail + 1) % KEY_QUEUE_SIZE;
 
 	if (next == key_queue_head)
@@ -1640,8 +1706,7 @@ void key_event_dispatch(void){
 
 /* -------------------- 按键回调函数 -------------------------- */
 
-void KEY_FUNC_Cb(KEY_EVENT ev)
-{
+void KEY_FUNC_Cb(KEY_EVENT ev){
     // Implement KEY_FUNC handling logic here
 	char str[32] = {0};
 	switch (ev.state){
@@ -1649,6 +1714,7 @@ void KEY_FUNC_Cb(KEY_EVENT ev)
 			if(alarming == 1){
 				alarming = 0;
 				Buzzer_Off();
+				led_bitmap &= ~(1<<1);
 				evt_send_alarm_off();
 				break;
 			}
@@ -1662,6 +1728,8 @@ void KEY_FUNC_Cb(KEY_EVENT ev)
 				temp_date = system_date;
 				temp_time = system_time;
 				temp_alarm = alarm_time;
+
+				led_bitmap |= (1<<2);
 
 				last_blink_tick = systick_count;
 				blinker = true;
@@ -1692,8 +1760,7 @@ void KEY_FUNC_Cb(KEY_EVENT ev)
 			break;
 	}
 }
-void KEY_SHIFT_Cb(KEY_EVENT ev)
-{
+void KEY_SHIFT_Cb(KEY_EVENT ev){
     // Implement KEY_SHIFT handling logic here
 	switch (ev.state){
 		case KEY_TAP:
@@ -1717,8 +1784,7 @@ void KEY_SHIFT_Cb(KEY_EVENT ev)
 			break;
 	}
 }
-void KEY_ADD_Cb(KEY_EVENT ev)
-{
+void KEY_ADD_Cb(KEY_EVENT ev){
 	// Implement KEY_ADD handling logic here
 	if(system_mode != MODE_SETTING) return;
     
@@ -1737,8 +1803,7 @@ void KEY_ADD_Cb(KEY_EVENT ev)
 			break;
 	}
 }
-void KEY_SAVE_Cb(KEY_EVENT ev)
-{
+void KEY_SAVE_Cb(KEY_EVENT ev){
     // Implement KEY_SAVE handling logic here
 	switch (ev.state){
 		case KEY_TAP:
@@ -1753,8 +1818,7 @@ void KEY_SAVE_Cb(KEY_EVENT ev)
 			break;
 	}
 }
-void KEY_DISP_Cb(KEY_EVENT ev)
-{
+void KEY_DISP_Cb(KEY_EVENT ev){
     // Implement KEY_DISP handling logic here
 	switch (ev.state){
 		case KEY_TAP:
@@ -1780,9 +1844,7 @@ void KEY_DISP_Cb(KEY_EVENT ev)
 			break;
 	}
 }
-void KEY_SPEED_Cb(KEY_EVENT ev)
-{
-    // 滚动速度切换: 250ms / 500ms
+void KEY_SPEED_Cb(KEY_EVENT ev){
 	switch (ev.state){
 		case KEY_TAP:
 			scroll_speed = (scroll_speed == 500) ? 250 : 500;
@@ -1794,22 +1856,26 @@ void KEY_SPEED_Cb(KEY_EVENT ev)
 			break;
 	}
 }
-void KEY_FORMAT_Cb(KEY_EVENT ev)
-{
-    // 滚动方向切换: LEFT(0) / RIGHT(1)
+void KEY_FORMAT_Cb(KEY_EVENT ev){
 	switch (ev.state){
 		case KEY_TAP:
-		case KEY_PRESS:
+		case KEY_PRESS:{
+			char tmp[DISP_LEN+1];
+			uint8_t tmp_dp;
+			memcpy(tmp, seg_disp_buf, DISP_LEN);
+			tmp[DISP_LEN] = '\0';
+			tmp_dp = seg_disp_dp;
 			display_format = (display_format == FORMAT_LEFT) ? FORMAT_RIGHT : FORMAT_LEFT;
-			break;
+			set_seg_disp(tmp, tmp_dp);
+			break;	
+		}
 		case KEY_PRESSUP:
 		case KEY_IDLE:
 		default:
 			break;
 	}
 }
-void KEY_EXT_Cb(KEY_EVENT ev)
-{
+void KEY_EXT_Cb(KEY_EVENT ev){
     // Implement KEY_EXT handling logic here
 	switch (ev.state){
 		case KEY_TAP:
@@ -1820,8 +1886,7 @@ void KEY_EXT_Cb(KEY_EVENT ev)
 			break;
 	}
 }
-void KEY_USER1_Cb(KEY_EVENT ev)
-{
+void KEY_USER1_Cb(KEY_EVENT ev){
     // Implement KEY_USER1 handling logic here
 	switch (ev.state){
 		case KEY_TAP:
@@ -1832,8 +1897,7 @@ void KEY_USER1_Cb(KEY_EVENT ev)
 			break;
 	}
 }
-void KEY_USER2_Cb(KEY_EVENT ev)
-{
+void KEY_USER2_Cb(KEY_EVENT ev){
     // Implement KEY_USER2 handling logic here
 	switch (ev.state){
 		case KEY_TAP:
@@ -1850,8 +1914,7 @@ void KEY_USER2_Cb(KEY_EVENT ev)
 
 /* ========================= Interrupt function ================================== */
 
-void S800_Int_Init(void)
-{
+void S800_Int_Init(void){
 	SysTickPeriodSet(ui32SysClock/SYSTICK_FREQUENCY);
 	SysTickEnable();
 	SysTickIntEnable();
@@ -1862,9 +1925,8 @@ void S800_Int_Init(void)
    	IntMasterEnable();
 }
 
-void SysTick_Handler(void)
-{
-	static volatile uint32_t cnt_2ms, cnt_10ms,  cnt_100ms,  cnt_1s;
+void SysTick_Handler(void){
+	static volatile uint32_t cnt_2ms, cnt_10ms, cnt_100ms, cnt_500ms, cnt_1s;
 
 	systick_count++;
 	flag_1ms = 1;
@@ -1880,22 +1942,27 @@ void SysTick_Handler(void)
 		cnt_100ms = 0;
 		flag_100ms = 1;
 	}
+	if(++cnt_500ms == 500){
+		cnt_500ms = 0;
+		flag_500ms = 1;
+	} 
 	if(++cnt_1s == 1000){
 		cnt_1s = 0;
 		flag_1s = 1;
 	}
 }
 
-void UART0_Handler(void)
-{
+void UART0_Handler(void){
 	static uint32_t RxBufIndex = 0;
 	uint32_t ui32Status;
 	ui32Status = UARTIntStatus(UART0_BASE, true);
 	UARTIntClear(UART0_BASE, ui32Status);
 
-	while(UARTCharsAvail(UART0_BASE))
+		while(UARTCharsAvail(UART0_BASE))
 	{
 		char ch = UARTCharGetNonBlocking(UART0_BASE);
+		uart_active = 1;
+		uart_last_active_tick = systick_count;
 		if(RxBufIndex < UART_BUFFER_SIZE - 1){
 			if (ch == '\r' || ch == '\n') {
 				if(RxBufIndex > 0){
@@ -1912,9 +1979,11 @@ void UART0_Handler(void)
 	}
 
 	if((ui32Status & UART_INT_RT)){
-		if(RxBufIndex > 0) RxBuf[RxBufIndex] = '\0';
-		RxBufIndex = 0;	
-		RxEndFlag = 1;
+		if(RxBufIndex > 0) {
+			RxBuf[RxBufIndex] = '\0';
+			RxBufIndex = 0;	
+			RxEndFlag = 1;
+		}
 	}
 }
 
@@ -2079,6 +2148,8 @@ void quit_setting(void){
 	setting = 0;
 	subitem = 0;
 
+	led_bitmap &= ~(1<<2);
+
 	setting_timeout_timer = systick_count;
 	blinker = true;
 
@@ -2183,6 +2254,8 @@ int main(void)
 			while(!key_queue_empty()){
 				key_event_dispatch();
 			}
+
+			led_refresh();
 		}
 
 		if(flag_100ms == 1){
@@ -2191,6 +2264,30 @@ int main(void)
 			if(is_add_pressing == 1){
 				add_cur_subitem();
 			}
+
+			/* UART 活动指示：LED 第4位 100ms 闪烁 */
+			if(system_mode != MODE_BOOT){
+				if(uart_active){
+					if(systick_count - uart_last_active_tick >= UART_ACTIVE_TIMEOUT){
+						uart_active = 0;
+						led_bitmap &= ~(1<<3);  // 超时熄灭
+					}else{
+						led_bitmap ^= (1<<3);   // 100ms 翻转闪烁
+					}
+				}else{
+					led_bitmap &= ~(1<<3);  // 无活动保持熄灭
+				}
+			}
+		}
+
+		if(flag_500ms == 1){
+			flag_500ms = 0;
+			if(system_mode != MODE_BOOT){
+				if(set_led_activate == 0){
+				led_bitmap ^= 0x01;
+			}
+			}
+			
 		}
 
 		if(RxEndFlag == 1){
@@ -2208,83 +2305,11 @@ int main(void)
 		}
 
 		blink_cur_subitem();
-		
-		// if(flag_1s == 1)
-		// {
-		// 	flag_1s = 0;
-		// 	/* 初始化数码管显示 */
-		// 	switch(boot_flag){
-		// 		case 0:{
-		// 			int i;
-		// 			for(i=0; i<8; ++i){
-		// 				seg_disp_buf[i] = 0xFF;
-		// 			}
-		// 			break;
-		// 		}
-		// 		case 2:
-		// 			set_seg_disp_from_string(MY_STUDENT_ID);
-		// 			break;
-		// 		case 4:
-		// 			set_seg_disp_from_string(MY_NAME);
-		// 			break;
-		// 		case 6:
-		// 			set_seg_disp_from_string(FW_VERSION);
-		// 			break;
-		// 		case 1: case 3: case 5: case 7:
-		// 			seg_clear();
-		// 			break;
-		// 		default: break;
-		// 	}
-		// 	if(boot_flag < 8) boot_flag++;
 
-		// 	clock_tick();
-		// }
-
-		// if(flag_5ms == 1){
-		// 	flag_5ms == 0;
-		// 	/* 数码管刷新 */	
-		// 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2,(uint8_t)0x00);
-		// 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT1,seg_disp_buf[seg_display_pos]);			
-		// 	I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2,(uint8_t)(1<<seg_display_pos));
-		// 	seg_display_pos = (seg_display_pos + 1) % 8;
-		// }
-		// if (systick_10ms_status)
-		// {
-		// 	systick_10ms_status		= 0;
-		// 	if (++gpio_flash_cnt	>= GPIO_FLASHTIME/10)
-		// 	{
-		// 		gpio_flash_cnt			= 0;
-		// 		if (gpio_status)
-		// 			GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_0,GPIO_PIN_0 );
-		// 		else
-		// 			GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_0,0);
-		// 		gpio_status					= !gpio_status;
-			
-		// 	}
-		// }
-		// if (systick_100ms_status)
-		// {
-		// 	systick_100ms_status = 0;
-		// 	if (++i2c_flash_cnt	>= I2C_FLASHTIME/100)
-		// 	{
-		// 		i2c_flash_cnt = 0;
-		// 		result = I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT1,seg7_digit[cnt+1]);	//write port 1 				
-		// 		result = I2C0_WriteByte(TCA6424_I2CADDR,TCA6424_OUTPUT_PORT2,rightshift);	//write port 2
-		
-		// 		result = I2C0_WriteByte(PCA9557_I2CADDR,PCA9557_OUTPUT,~rightshift);	
-
-		// 		cnt++;
-		// 		rightshift= rightshift<<1;
-
-		// 		if (cnt >= 0x8)
-		// 		{
-		// 			rightshift = 0x01;
-		// 			cnt = 0;
-		// 		}
-
-		// 	}
-		// }
-
-		
+		/* *SET:LED 激活超时检查：10s 无新指令则恢复其他 LED 逻辑 */
+		if (set_led_activate && (systick_count - last_set_led_time >= 10000)) {
+			set_led_activate = 0;
+			led_on(0x00);
+		}
 	}
 }

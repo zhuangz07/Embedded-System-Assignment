@@ -224,10 +224,6 @@ class ClockSystemApp:
             # 显示变化事件
             disp_str, dp_hex = ProtocolParser.parse_disp_event(event_data)
             
-            # 根据FORMAT处理
-            if self.current_format == 'RIGHT':
-                disp_str, dp_hex = ProtocolParser.reverse_display(disp_str, dp_hex)
-            
             # 更新数字孪生面板
             self.twin_panel.update_display(disp_str, dp_hex)
             
