@@ -319,6 +319,23 @@ volatile uint8_t alarming = 0;
 
 void alarm(void);
 
+/* ---------- 倒计时 ---------- */
+typedef enum {
+    COUNTDOWN_IDLE = 0,   // 未激活
+    COUNTDOWN_RUNNING,    // 倒计时进行中
+    COUNTDOWN_EXPIRED     // 倒计时结束，闪烁10s
+} COUNTDOWN_STATE;
+
+COUNTDOWN_STATE countdown_state = COUNTDOWN_IDLE;
+uint32_t countdown_total_ms = 0;      // 总倒计时时长(ms)
+uint32_t countdown_start_tick = 0;    // 开始时的 systick_count
+uint32_t countdown_expire_tick = 0;   // 结束时的 systick_count（用于10s闪烁）
+uint8_t  countdown_alarm_tick = 0;    // 闪烁响铃计数（复用 alarm() 节拍）
+
+void countdown_start(time_t duration);
+void countdown_update(void);
+void countdown_expire_alarm(void);
+
 /* ======================= 按键处理 ======================= */
 typedef enum{
 	KEY_NONE = 0, 
@@ -414,15 +431,24 @@ typedef enum{
 	MODE_SHOW_DATE_2,
 	MODE_SETTING,
 	MODE_SHOW_USER_MSG,
-	MODE_SHOW_WEATHER
+	MODE_SHOW_WEATHER,
+	MODE_COUNTDOWN
 } SYSTEM_MODE;		// 系统显示模式
 SYSTEM_MODE system_mode = MODE_BOOT;
 SYSTEM_MODE temp_mode = MODE_BOOT;		// 用于进入设置项/显示用户信息时，保存进入前的模式
 
 typedef enum{
+	MODE_DAY = 0,
+	MODE_NIGHT
+} SYSTEM_LIGHT;
+SYSTEM_LIGHT system_light = MODE_DAY;
+
+
+typedef enum{
 	SET_DATE = 0,
 	SET_TIME,
-	SET_ALARM
+	SET_ALARM,
+	SET_COUNTDOWN
 } SET_ITEM;			// 设置项
 SET_ITEM setting = SET_DATE;
 
@@ -435,7 +461,7 @@ SET_SUBITEM subitem = SET_YEAR_HOUR;
 
 // 用于临时存储未保存的设置项
 date_t temp_date;
-time_t temp_time, temp_alarm;
+time_t temp_time, temp_alarm, temp_countdown;
 
 // 设置超时计时器
 volatile uint32_t setting_timeout_timer = 0;
@@ -446,7 +472,8 @@ volatile uint32_t last_blink_tick = 0;
 bool blinker = true;
 void blink_cur_subitem(void);
 
-void quit_setting(void);
+void quit_setting(bool by_save);  // by_save=true 表示用户主动按S4退出
+void show_countdown(uint32_t remain_sec);
 
 
 /* ========================= UART function ================================== */
@@ -663,6 +690,7 @@ void cmd_RST(void){
     system_time.sec = 0;
     display_on = true;
     display_format = FORMAT_LEFT;
+    system_light = MODE_DAY;
 	user_msg_active = 0;
     memset(user_msg, 0, sizeof(user_msg));
     msg_scroll_offset = 0;
@@ -882,6 +910,82 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
         return;
     }
 
+	    // ---- *SET:TIMER ----
+    if (match_abbr(type_str, "TIMER")) {
+        int v;
+        int i;
+        int kw_count = 0;
+        int val_start;
+        static char kws[3][PROTO_MAX_FRAME_LEN/2];
+        time_t new_time = system_time;
+
+		/* OFF 是独立关键字，无对应值，单独处理 */
+        if (argc >= 2) {
+            char tmp[PROTO_MAX_FRAME_LEN/2];
+            strncpy(tmp, args[1], sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+            str_toupper(tmp);
+            if (match_abbr(tmp, "OFF")) {
+                countdown_state = COUNTDOWN_IDLE;
+				Buzzer_Off();
+				led_bitmap &= ~(1<<1);
+				system_mode = temp_mode;
+				switch(system_mode){
+					case MODE_SHOW_TIME:   show_time();   break;
+					case MODE_SHOW_DATE_1: show_date_1(); break;
+					case MODE_SHOW_DATE_2: show_date_2(); break;
+					default: break;
+				}
+				return;
+            }
+        }
+
+        /* 第一遍：统计关键字数量 */
+        for (i = 1; i < argc && kw_count < 3; i++) {
+            static char tmp[PROTO_MAX_FRAME_LEN/2];
+            strncpy(tmp, args[i], sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+            str_toupper(tmp);
+            if (match_abbr(tmp, "HOUR") || match_abbr(tmp, "MINute") || match_abbr(tmp, "SECond")) {
+                strncpy(kws[kw_count], tmp, sizeof(kws[0]) - 1);
+                kws[kw_count][sizeof(kws[0]) - 1] = '\0';
+                kw_count++;
+            } else {
+                break;
+            }
+        }
+        val_start = 1 + kw_count;
+
+        if (kw_count == 0 || (argc - val_start) != kw_count) {
+            respond_error(ERROR_PARAM_STR);
+            return;
+        }
+
+        /* 第二遍：按顺序赋值 */
+        for (i = 0; i < kw_count; i++) {
+            v = (int)strtol(args[val_start + i], NULL, 10);
+            if (match_abbr(kws[i], "HOUR")) {
+                if (v < 0 || v > 23) { respond_error(ERROR_RANGE_STR); return; }
+                new_time.hour = (uint8_t)v;
+                        } else if (match_abbr(kws[i], "MINute")) {
+                if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
+                new_time.min = (uint8_t)v;
+            } else if (match_abbr(kws[i], "SECond")) {
+                if (v < 0 || v > 59) { respond_error(ERROR_RANGE_STR); return; }
+                new_time.sec = (uint8_t)v;
+            }
+        }
+
+        if (!is_valid_time(new_time)) {
+            respond_error(ERROR_RANGE_STR);
+            return;
+        }
+
+		temp_mode = system_mode;
+		countdown_start(new_time);
+        return;
+    }
+
     // ---- *SET:DISPlay ----
     if (match_abbr(type_str, "DISPlay")) {
 		static char val[PROTO_MAX_FRAME_LEN/2];
@@ -1003,7 +1107,7 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
         return;
     }
 
-        // ---- *SET:MODE (扩展) ----
+    // ---- *SET:MODE ----
     if (match_abbr(type_str, "MODE")) {
 		char val[PROTO_MAX_FRAME_LEN/2];
         if (argc < 2) { respond_error(ERROR_PARAM_STR); return; }
@@ -1011,7 +1115,12 @@ void cmd_SET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
         strncpy(val, args[1], sizeof(val) - 1);
         val[sizeof(val) - 1] = '\0';
         str_toupper(val);
-        if (strcmp(val, "DAY") == 0 || strcmp(val, "NIGHT") == 0) {
+        if (strcmp(val, "DAY") == 0) {
+            system_light = MODE_DAY;
+            respond_ok();
+            evt_send_mode(val);
+        } else if (strcmp(val, "NIGHT") == 0) {
+            system_light = MODE_NIGHT;
             respond_ok();
             evt_send_mode(val);
         } else {
@@ -1090,7 +1199,7 @@ void cmd_GET(char args[PROTO_ARG_MAX][PROTO_MAX_FRAME_LEN/2], int argc){
         } else if (match_abbr(type_str, "ALARM")) {
             sprintf(data, "%02d.%02d.%02d", alarm_time.hour, alarm_time.min, alarm_time.sec);
             reverse_response = true;
-        } else if (match_abbr(type_str, "DISP")) {
+        } else if (match_abbr(type_str, "DISPlay")) {
             strcpy(data, display_on ? "ON" : "OFF");
         } else if (match_abbr(type_str, "FORMAT")) {
             strcpy(data, (display_format == FORMAT_LEFT) ? "LEFT" : "RIGHT");
@@ -1615,7 +1724,11 @@ void add_sys_year(void) {
 
 void show_time(void){
 	char buf[16];
-	sprintf(buf, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
+	if (system_light == MODE_NIGHT) {
+		sprintf(buf, "%02d.%02d", system_time.hour, system_time.min);
+	} else {
+		sprintf(buf, "%02d.%02d.%02d", system_time.hour, system_time.min, system_time.sec);
+	}
 	set_seg_disp_from_string(buf);
 }
 
@@ -1783,12 +1896,26 @@ void KEY_FUNC_Cb(KEY_EVENT ev){
     // Implement KEY_FUNC handling logic here
 	char str[32] = {0};
 	switch (ev.state){
-		case KEY_TAP:
+				case KEY_TAP:
 			if(alarming == 1){
 				alarming = 0;
 				Buzzer_Off();
 				led_bitmap &= ~(1<<1);
 				evt_send_alarm_off();
+				break;
+			}
+			/* 倒计时进行中或结束闪烁时，按 FUNC 停止倒计时 */
+			if (countdown_state == COUNTDOWN_RUNNING || countdown_state == COUNTDOWN_EXPIRED) {
+				countdown_state = COUNTDOWN_IDLE;
+				Buzzer_Off();
+				led_bitmap &= ~(1<<1);
+				system_mode = temp_mode;
+				switch(system_mode){
+					case MODE_SHOW_TIME:   show_time();   break;
+					case MODE_SHOW_DATE_1: show_date_1(); break;
+					case MODE_SHOW_DATE_2: show_date_2(); break;
+					default: break;
+				}
 				break;
 			}
 			if (system_mode != MODE_SETTING){
@@ -1801,8 +1928,13 @@ void KEY_FUNC_Cb(KEY_EVENT ev){
 				temp_date = system_date;
 				temp_time = system_time;
 				temp_alarm = alarm_time;
+				temp_countdown.hour = 0;
+				temp_countdown.min = 0;
+				temp_countdown.sec = 0;
 
-				led_bitmap |= (1<<2);
+				if (system_light == MODE_DAY) {
+					led_bitmap |= (1<<2);
+				}
 
 				last_blink_tick = systick_count;
 				blinker = true;
@@ -1815,16 +1947,17 @@ void KEY_FUNC_Cb(KEY_EVENT ev){
 
 			setting_timeout_timer = systick_count;
 			switch(setting){
-				case SET_DATE:	setting = SET_TIME;		break;
-				case SET_TIME:	setting = SET_ALARM;	break;
-				case SET_ALARM:	setting = SET_DATE; 	break;
+				case SET_DATE:		setting = SET_TIME;		 break;
+				case SET_TIME:		setting = SET_ALARM;	 break;
+				case SET_ALARM:		setting = SET_COUNTDOWN; break;
+				case SET_COUNTDOWN:	setting = SET_DATE;		 break;
 				default: break;
 			}
 			subitem = SET_YEAR_HOUR;
 			break;
 
 		case KEY_PRESS:
-			quit_setting();
+			quit_setting(false);
 			break;
 
 		case KEY_PRESSUP:
@@ -1882,7 +2015,7 @@ void KEY_SAVE_Cb(KEY_EVENT ev){
 		case KEY_TAP:
 		case KEY_PRESS:
 			if(system_mode == MODE_SETTING){
-				quit_setting();
+				quit_setting(true);  // S4 主动保存退出
 			}
 			break;
 		case KEY_PRESSUP:
@@ -1963,7 +2096,7 @@ void KEY_USER1_Cb(KEY_EVENT ev){
     // Implement KEY_USER1 handling logic here
 	switch (ev.state){
 		case KEY_TAP:
-			respond("*NTP SYNC");
+			respond("*REQ:SYNC");
 			break;
 		case KEY_PRESS:
 			break;
@@ -1977,6 +2110,8 @@ void KEY_USER2_Cb(KEY_EVENT ev){
     // Implement KEY_USER2 handling logic here
 	switch (ev.state){
 		case KEY_TAP:
+			respond("*REQ:WEA");
+			break;
 		case KEY_PRESS:
 		case KEY_PRESSUP:
 		case KEY_IDLE:
@@ -2104,9 +2239,9 @@ void add_cur_subitem(void){
                 default:
                     break;
 			}
-			sprintf(str, "%02d.%02d.%02d", temp_time.hour, temp_time.min, temp_time.sec);
+			sprintf(str, "%02d.%02d.%02d_T", temp_time.hour, temp_time.min, temp_time.sec);
             break;
-        case SET_ALARM:
+                case SET_ALARM:
             switch(subitem){
                 case SET_YEAR_HOUR:
                     add_hour(&temp_alarm);
@@ -2120,7 +2255,25 @@ void add_cur_subitem(void){
                 default:
                     break;
             }
-			sprintf(str, "%02d.%02d.%02d", temp_alarm.hour, temp_alarm.min, temp_alarm.sec);
+			sprintf(str, "%02d.%02d.%02d_A", temp_alarm.hour, temp_alarm.min, temp_alarm.sec);
+            break;
+        case SET_COUNTDOWN:
+            switch(subitem){
+                case SET_YEAR_HOUR:
+                    add_hour(&temp_countdown);
+                    /* 倒计时最大 99:59:59，小时上限设为 99 */
+                    if(temp_countdown.hour > 23) temp_countdown.hour = 0;
+                    break;
+                case SET_MONTH_MIN:
+                    add_min(&temp_countdown);
+                    break;
+                case SET_DAY_SEC:
+                    add_sec(&temp_countdown);
+                    break;
+                default:
+                    break;
+            }
+            sprintf(str, "%02d.%02d.%02d_C", temp_countdown.hour, temp_countdown.min, temp_countdown.sec);
             break;
         default:
             break;
@@ -2135,7 +2288,7 @@ void blink_cur_subitem(void){
 	if(system_mode != MODE_SETTING) return;
 
 	if(systick_count - setting_timeout_timer >= 5000){
-		quit_setting();
+		quit_setting(false);  // 超时退出，不启动倒计时
 		return;
 	}
 
@@ -2165,7 +2318,7 @@ void blink_cur_subitem(void){
 				}
 				break;
 			case SET_TIME:
-				sprintf(str, "%02d.%02d.%02d", temp_time.hour, temp_time.min, temp_time.sec);
+				sprintf(str, "%02d.%02d.%02d_T", temp_time.hour, temp_time.min, temp_time.sec);
 				if(!blinker){
 					switch(subitem){
 						case SET_YEAR_HOUR:
@@ -2186,7 +2339,28 @@ void blink_cur_subitem(void){
 				}
 				break;
 			case SET_ALARM:
-				sprintf(str, "%02d.%02d.%02d", temp_alarm.hour, temp_alarm.min, temp_alarm.sec);
+				sprintf(str, "%02d.%02d.%02d_A", temp_alarm.hour, temp_alarm.min, temp_alarm.sec);
+				if(!blinker){
+					switch(subitem){
+					case SET_YEAR_HOUR:
+						str[0] = ' ';
+						str[1] = ' ';
+						break;
+					case SET_MONTH_MIN:
+						str[3] = ' ';
+						str[4] = ' ';
+						break;
+					case SET_DAY_SEC:
+						str[6] = ' ';
+						str[7] = ' ';
+						break;
+					default:
+						break;
+					}
+				}
+				break;
+			case SET_COUNTDOWN:
+				sprintf(str, "%02d.%02d.%02d_C", temp_countdown.hour, temp_countdown.min, temp_countdown.sec);
 				if(!blinker){
 					switch(subitem){
 					case SET_YEAR_HOUR:
@@ -2216,17 +2390,36 @@ void blink_cur_subitem(void){
 	}
 }
 
-void quit_setting(void){
+void quit_setting(bool by_save){
 	if(system_mode != MODE_SETTING) return;
 
 	system_date = temp_date;
 	system_time = temp_time;
-	alarm_time 	= temp_alarm;
+	alarm_time  = temp_alarm;
+
+	/* 仅当 S4 主动退出 且 当前处于倒计时设置项 时启动倒计时 */
+	if (by_save && setting == SET_COUNTDOWN) {
+		uint32_t total_sec = (uint32_t)temp_countdown.hour * 3600u
+		                   + (uint32_t)temp_countdown.min  * 60u
+		                   + (uint32_t)temp_countdown.sec;
+		if (total_sec > 0) {
+			setting = 0;
+			subitem = 0;
+			if (system_light == MODE_DAY) {
+				led_bitmap &= ~(1<<2);
+			}
+			blinker = true;
+			countdown_start(temp_countdown);
+			return;
+		}
+	}
 
 	setting = 0;
 	subitem = 0;
 
-	led_bitmap &= ~(1<<2);
+	if (system_light == MODE_DAY) {
+		led_bitmap &= ~(1<<2);
+	}
 
 	setting_timeout_timer = systick_count;
 	blinker = true;
@@ -2244,7 +2437,87 @@ void quit_setting(void){
 			break;
 		default: break;
 	}
+}
 
+/* ========================= 倒计时功能代码 ================================== */
+
+void show_countdown(uint32_t remain_sec){
+	char buf[16];
+	uint8_t h = (uint8_t)(remain_sec / 3600u);
+	uint8_t m = (uint8_t)((remain_sec % 3600u) / 60u);
+	uint8_t s = (uint8_t)(remain_sec % 60u);
+	sprintf(buf, "%02d.%02d.%02d", h, m, s);
+	set_seg_disp_from_string(buf);
+}
+
+void countdown_start(time_t duration){
+	countdown_total_ms = ((uint32_t)duration.hour * 3600u
+	                    + (uint32_t)duration.min  * 60u
+	                    + (uint32_t)duration.sec) * 1000u;
+	countdown_start_tick = systick_count;
+	countdown_state = COUNTDOWN_RUNNING;
+	countdown_alarm_tick = 0;
+	/* 切换到倒计时显示模式，temp_mode 已在进入设置前保存好 */
+	system_mode = MODE_COUNTDOWN;
+	show_countdown(countdown_total_ms / 1000u);
+}
+
+void countdown_update(void){
+	if (countdown_state == COUNTDOWN_RUNNING) {
+		uint32_t elapsed_ms = systick_count - countdown_start_tick;
+		if (elapsed_ms >= countdown_total_ms) {
+			/* 倒计时归零 */
+			show_countdown(0);
+						countdown_state = COUNTDOWN_EXPIRED;
+			countdown_expire_tick = systick_count;
+			countdown_alarm_tick = 0xFF;
+		} else {
+			uint32_t remain_ms  = countdown_total_ms - elapsed_ms;
+			/* 只在整秒变化时刷新显示，避免每毫秒都写 I2C */
+			static uint32_t last_shown_sec = 0xFFFFFFFFu;
+			uint32_t remain_sec = (remain_ms + 999u) / 1000u;  // 向上取整，到0时归零
+			if (remain_sec != last_shown_sec) {
+				last_shown_sec = remain_sec;
+				show_countdown(remain_sec);
+			}
+		}
+	}
+}
+
+void countdown_expire_alarm(void){
+	uint32_t elapsed_ms;
+	uint8_t cur_sec;
+
+	if (countdown_state != COUNTDOWN_EXPIRED) return;
+
+	elapsed_ms = systick_count - countdown_expire_tick;
+
+	if (elapsed_ms >= 10000) {
+		/* 10s 结束，恢复原模式 */
+		Buzzer_Off();
+		led_bitmap &= ~(1<<1);
+		countdown_state = COUNTDOWN_IDLE;
+		system_mode = temp_mode;
+		switch(system_mode){
+			case MODE_SHOW_TIME:   show_time();   break;
+			case MODE_SHOW_DATE_1: show_date_1(); break;
+			case MODE_SHOW_DATE_2: show_date_2(); break;
+			default: break;
+		}
+	} else {
+		cur_sec = (uint8_t)(elapsed_ms / 1000);
+		if (cur_sec != countdown_alarm_tick) {
+			countdown_alarm_tick = cur_sec;
+			Buzzer_Toggle();
+			led_bitmap ^= (1<<1);
+			/* 奇数秒显示，偶数秒清屏 —— 实现闪烁 */
+			if (cur_sec & 1) {
+				show_countdown(0);
+			} else {
+				seg_clear();
+			}
+		}
+	}
 }
 
 /* =============== MAIN =============== */
@@ -2287,6 +2560,8 @@ int main(void){
 					break;
 				case MODE_SETTING:
 					break;
+				case MODE_COUNTDOWN:
+						break;
 				default: break;
 			}
 
@@ -2296,7 +2571,7 @@ int main(void){
 				led_on(0x00);
 			}
 
-			if(time_equal(alarm_time, system_time))	// 闹钟时间到
+			if(time_equal(alarm_time, system_time) && system_light == MODE_DAY)	// 闹钟时间到（NIGHT模式不响）
 			{
 				alarming = 1;
 				evt_send_alarm();
@@ -2358,8 +2633,8 @@ int main(void){
 				add_cur_subitem();
 			}
 
-			/* UART 活动指示：LED 第4位 100ms 闪烁 */
-			if(system_mode != MODE_BOOT){
+						/* UART 活动指示：LED 第4位 100ms 闪烁（NIGHT模式不亮） */
+			if(system_mode != MODE_BOOT && system_light == MODE_DAY){
 				if(uart_active){
 					if(systick_count - uart_last_active_tick >= UART_ACTIVE_TIMEOUT){
 						uart_active = 0;
@@ -2376,7 +2651,11 @@ int main(void){
 		if(flag_500ms == 1){
 			flag_500ms = 0;
 			if(system_mode != MODE_BOOT){
-				if(set_led_activate == 0){
+				if (system_light == MODE_NIGHT) {
+					/* NIGHT 模式：仅保留心跳 LED1 (bit0)，其余全部熄灭 */
+					led_bitmap ^= 0x01;
+					led_bitmap &= 0x01;
+				} else if(set_led_activate == 0){
 					led_bitmap ^= 0x01;
 				
 					/* 天气相关 LED 控制 */
@@ -2418,6 +2697,16 @@ int main(void){
 
 		if(system_mode == MODE_SHOW_USER_MSG){
 			disp_user_msg();
+		}
+
+		/* 倒计时运行中：逐毫秒检查剩余时间并刷新显示 */
+		if(system_mode == MODE_COUNTDOWN && countdown_state == COUNTDOWN_RUNNING){
+			countdown_update();
+		}
+
+		/* 倒计时结束闪烁：内部自驱动，无需 flag_1s */
+		if(system_mode == MODE_COUNTDOWN && countdown_state == COUNTDOWN_EXPIRED){
+			countdown_expire_alarm();
 		}
 
 		blink_cur_subitem();
