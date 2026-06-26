@@ -129,6 +129,11 @@ class ProtocolParser:
         if response.startswith('*PONG'):
             uptime = response[5:].strip() if len(response) > 5 else None
             return 'PONG', uptime, None
+
+        # REQ响应
+        if response.startswith('*REQ:'):
+            data = response[5:].strip() if len(response) > 5 else None
+            return 'REQ', data, None
         
         return 'UNKNOWN', response, None
     
@@ -366,6 +371,32 @@ class CommandBuilder:
         """查询显示状态"""
         return ProtocolParser.build_get_command('DISPLAY')
     
+    @staticmethod
+    def set_timer(hour: Optional[int] = None, minute: Optional[int] = None,
+                  second: Optional[int] = None, off: bool = False) -> str:
+        """设置倒计时 - 格式: *SET:TIMER HOUR MINUTE SECOND 00 05 30"""
+        if off:
+            return "*SET:TIMER OFF\r\n"
+
+        param_names = []
+        param_values = []
+
+        if hour is not None:
+            param_names.append('HOUR')
+            param_values.append(str(hour))
+        if minute is not None:
+            param_names.append('MINUTE')
+            param_values.append(str(minute))
+        if second is not None:
+            param_names.append('SECOND')
+            param_values.append(str(second))
+
+        if param_names:
+            cmd = f"*SET:TIMER {' '.join(param_names)} {' '.join(param_values)}\r\n"
+        else:
+            cmd = "*SET:TIMER\r\n"
+        return cmd
+
     @staticmethod
     def get_format() -> str:
         """查询显示方向"""

@@ -215,45 +215,45 @@ class MainWindow(QMainWindow):
         datetime_layout = QGridLayout()
         
         # 日期设置
-        datetime_layout.addWidget(QLabel("年:"), 0, 0)
         self.year_spin = QSpinBox()
-        self.year_spin.setRange(2000, 2099)
+        self.year_spin.setRange(1960, 2099)
         self.year_spin.setValue(2026)
-        datetime_layout.addWidget(self.year_spin, 0, 1)
+        datetime_layout.addWidget(self.year_spin, 0, 0)
+        datetime_layout.addWidget(QLabel("年"), 0, 1)
         
-        datetime_layout.addWidget(QLabel("月:"), 0, 2)
         self.month_spin = QSpinBox()
         self.month_spin.setRange(1, 12)
         self.month_spin.setValue(6)
-        datetime_layout.addWidget(self.month_spin, 0, 3)
-        
-        datetime_layout.addWidget(QLabel("日:"), 0, 4)
+        datetime_layout.addWidget(self.month_spin, 0, 2)
+        datetime_layout.addWidget(QLabel("月"), 0, 3)
+
         self.date_spin = QSpinBox()
         self.date_spin.setRange(1, 31)
         self.date_spin.setValue(1)
-        datetime_layout.addWidget(self.date_spin, 0, 5)
+        datetime_layout.addWidget(self.date_spin, 0, 4)
+        datetime_layout.addWidget(QLabel("日"), 0, 5)
         
         self.set_date_btn = QPushButton("设置日期")
         datetime_layout.addWidget(self.set_date_btn, 0, 6)
         
         # 时间设置
-        datetime_layout.addWidget(QLabel("时:"), 1, 0)
         self.hour_spin = QSpinBox()
         self.hour_spin.setRange(0, 23)
         self.hour_spin.setValue(12)
-        datetime_layout.addWidget(self.hour_spin, 1, 1)
-        
-        datetime_layout.addWidget(QLabel("分:"), 1, 2)
+        datetime_layout.addWidget(self.hour_spin, 1, 0)
+        datetime_layout.addWidget(QLabel("时"), 1, 1)
+
         self.minute_spin = QSpinBox()
         self.minute_spin.setRange(0, 59)
         self.minute_spin.setValue(0)
-        datetime_layout.addWidget(self.minute_spin, 1, 3)
-        
-        datetime_layout.addWidget(QLabel("秒:"), 1, 4)
+        datetime_layout.addWidget(self.minute_spin, 1, 2)
+        datetime_layout.addWidget(QLabel("分"), 1, 3)
+
         self.second_spin = QSpinBox()
         self.second_spin.setRange(0, 59)
         self.second_spin.setValue(0)
-        datetime_layout.addWidget(self.second_spin, 1, 5)
+        datetime_layout.addWidget(self.second_spin, 1, 4)
+        datetime_layout.addWidget(QLabel("秒"), 1, 5)
         
         self.set_time_btn = QPushButton("设置时间")
         datetime_layout.addWidget(self.set_time_btn, 1, 6)
@@ -265,23 +265,23 @@ class MainWindow(QMainWindow):
         alarm_group = QGroupBox("闹钟设置")
         alarm_layout = QGridLayout()
         
-        alarm_layout.addWidget(QLabel("时:"), 0, 0)
         self.alarm_hour_spin = QSpinBox()
         self.alarm_hour_spin.setRange(0, 23)
         self.alarm_hour_spin.setValue(7)
-        alarm_layout.addWidget(self.alarm_hour_spin, 0, 1)
-        
-        alarm_layout.addWidget(QLabel("分:"), 0, 2)
+        alarm_layout.addWidget(self.alarm_hour_spin, 0, 0)
+        alarm_layout.addWidget(QLabel("时"), 0, 1)
+
         self.alarm_minute_spin = QSpinBox()
         self.alarm_minute_spin.setRange(0, 59)
         self.alarm_minute_spin.setValue(0)
-        alarm_layout.addWidget(self.alarm_minute_spin, 0, 3)
-        
-        alarm_layout.addWidget(QLabel("秒:"), 0, 4)
+        alarm_layout.addWidget(self.alarm_minute_spin, 0, 2)
+        alarm_layout.addWidget(QLabel("分"), 0, 3)
+
         self.alarm_second_spin = QSpinBox()
         self.alarm_second_spin.setRange(0, 59)
         self.alarm_second_spin.setValue(0)
-        alarm_layout.addWidget(self.alarm_second_spin, 0, 5)
+        alarm_layout.addWidget(self.alarm_second_spin, 0, 4)
+        alarm_layout.addWidget(QLabel("秒"), 0, 5)
         
         self.set_alarm_btn = QPushButton("设置闹钟")
         alarm_layout.addWidget(self.set_alarm_btn, 0, 6)
@@ -291,6 +291,37 @@ class MainWindow(QMainWindow):
         
         alarm_group.setLayout(alarm_layout)
         layout.addWidget(alarm_group)
+        
+        # 倒计时设置
+        timer_group = QGroupBox("倒计时设置")
+        timer_layout = QGridLayout()
+        
+        self.timer_hour_spin = QSpinBox()
+        self.timer_hour_spin.setRange(0, 23)
+        self.timer_hour_spin.setValue(0)
+        timer_layout.addWidget(self.timer_hour_spin, 0, 0)
+        timer_layout.addWidget(QLabel("时"), 0, 1)
+        
+        self.timer_minute_spin = QSpinBox()
+        self.timer_minute_spin.setRange(0, 59)
+        self.timer_minute_spin.setValue(0)
+        timer_layout.addWidget(self.timer_minute_spin, 0, 2)
+        timer_layout.addWidget(QLabel("分"), 0, 3)
+        
+        self.timer_second_spin = QSpinBox()
+        self.timer_second_spin.setRange(0, 59)
+        self.timer_second_spin.setValue(30)
+        timer_layout.addWidget(self.timer_second_spin, 0, 4)
+        timer_layout.addWidget(QLabel("秒"), 0, 5)
+        
+        self.set_timer_btn = QPushButton("设置倒计时")
+        timer_layout.addWidget(self.set_timer_btn, 0, 6)
+        
+        self.timer_off_btn = QPushButton("关闭倒计时")
+        timer_layout.addWidget(self.timer_off_btn, 0, 7)
+        
+        timer_group.setLayout(timer_layout)
+        layout.addWidget(timer_group)
         
         # 显示控制
         display_group = QGroupBox("显示控制")
@@ -318,10 +349,10 @@ class MainWindow(QMainWindow):
         misc_layout.addWidget(QLabel("消息:"), 0, 0)
         self.msg_edit = QLineEdit()
         self.msg_edit.setPlaceholderText("输入滚动消息(≤32字节)")
-        misc_layout.addWidget(self.msg_edit, 0, 1, 1, 2)
+        misc_layout.addWidget(self.msg_edit, 0, 1, 1, 3)
         
         self.send_msg_btn = QPushButton("发送消息")
-        misc_layout.addWidget(self.send_msg_btn, 0, 3)
+        misc_layout.addWidget(self.send_msg_btn, 0, 4)
         
         misc_layout.addWidget(QLabel("蜂鸣(ms):"), 1, 0)
         self.beep_spin = QSpinBox()
@@ -392,6 +423,15 @@ class MainWindow(QMainWindow):
         
         self.mode_night_btn = QPushButton("夜间模式 (E3)")
         ext_layout.addWidget(self.mode_night_btn, 2, 1)
+        
+        # 自动昼夜模式
+        self.auto_mode_btn = QPushButton("自动昼夜模式 (E4)")
+        self.auto_mode_btn.setStyleSheet("background-color: #9C27B0;")
+        self.auto_mode_btn.setCheckable(True)
+        ext_layout.addWidget(self.auto_mode_btn, 3, 0)
+        
+        self.auto_mode_status = QLabel("状态: 未启用")
+        ext_layout.addWidget(self.auto_mode_status, 3, 1)
         
         ext_group.setLayout(ext_layout)
         layout.addWidget(ext_group)

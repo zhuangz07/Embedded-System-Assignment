@@ -8,7 +8,7 @@ import sys
 import time
 from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog
 from PyQt5.QtCore import QTimer
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import ntplib
 import requests
 
@@ -32,6 +32,12 @@ class ClockSystemApp:
         self.alarm_enabled = False
         self.display_on = True
         
+        # 自动昼夜模式状态
+        self.auto_mode_enabled = False
+        self._sunrise_time = None  # datetime.time 对象，本地时间
+        self._sunset_time = None   # datetime.time 对象，本地时间
+        self._sun_info_date = None  # 上次查询日出日落的日期
+        
         # 数字孪生面板
         self.twin_panel = DigitalTwinPanel()
         self.window.twin_panel_container.layout().addWidget(self.twin_panel)
@@ -42,6 +48,10 @@ class ClockSystemApp:
         # 定时器：延迟显示刷新（不自动发送PING，仅手动点击PING按钮时更新）
         self.heartbeat_timer = QTimer()
         self.heartbeat_timer.timeout.connect(self.update_uptime_display)
+        
+        # 定时器：自动昼夜模式检查（每60秒检查一次）
+        self.auto_mode_timer = QTimer()
+        self.auto_mode_timer.timeout.connect(self.check_auto_mode)
         
         # 初始化
         self.refresh_ports()
@@ -75,6 +85,7 @@ class ClockSystemApp:
         self.window.weather_btn.clicked.connect(self.on_get_weather)
         self.window.mode_day_btn.clicked.connect(lambda: self.on_set_mode(True))
         self.window.mode_night_btn.clicked.connect(lambda: self.on_set_mode(False))
+        self.window.auto_mode_btn.clicked.connect(self.on_toggle_auto_mode)
         
         self.window.combo_send_btn.clicked.connect(self.on_send_combo)
         self.window.abbr_min_btn.clicked.connect(lambda: self.send_command("*SET:TIME MIN 30"))
@@ -203,6 +214,15 @@ class ClockSystemApp:
                 latency=stats['latency'],
                 uptime=stats['uptime']
             )
+        
+        elif resp_type == 'REQ':
+            if resp_data == 'SYNC':
+                self.on_ntp_sync()
+            elif resp_data == 'WEA':
+                self.on_get_weather()
+            else:
+                self.window.append_log(f"ERROR {resp_data}", 'error')
+                QMessageBox.warning(self.window, "请求错误", f"S800板请求错误: {resp_data}")
             
         else:
             self.window.append_log(f"未知响应: {data}", 'error')
@@ -217,12 +237,6 @@ class ClockSystemApp:
             # 按键事件
             key_name = event_data
             self.window.append_log(f"按键按下: {key_name}", 'event')
-            
-            # # 特殊处理USER1 - 自动触发NTP对时
-            # if key_name == 'USER1':
-            #     self.on_ntp_sync()
-            # elif key_name == 'USER2':
-            #     self.on_get_weather()
             
         elif event_type == 'DISP':
             # 显示变化事件
@@ -460,6 +474,128 @@ class ClockSystemApp:
         self.current_mode = 'DAY' if day else 'NIGHT'
         self.window.update_status_bar(mode_val=self.current_mode)
         self.twin_panel.set_night_mode(not day)
+
+    # === 自动昼夜模式 (E4) ===
+
+    def _fetch_sun_times(self) -> bool:
+        """
+        查询固定坐标的日出日落时间。
+        固定使用 31°01'36.27"N 121°26'14.61"E（上海交通大学闵行校区）。
+        结果缓存到 self._sunrise_time / self._sunset_time。
+        返回是否查询成功。
+        """
+        today = datetime.now().date()
+        # 同一天内直接使用缓存
+        if self._sun_info_date == today and self._sunrise_time and self._sunset_time:
+            return True
+
+        try:
+            # 固定坐标：31°01'36.27"N 121°26'14.61"E
+            lat, lon = 31.026742, 121.437392
+
+            # 查询日出日落时间（UTC）
+            sun_resp = requests.get(
+                'https://api.sunrise-sunset.org/json',
+                params={'lat': lat, 'lng': lon, 'formatted': 0},
+                timeout=5
+            )
+            sun_resp.raise_for_status()
+            sun_data = sun_resp.json()
+
+            if sun_data.get('status') != 'OK':
+                raise ValueError(f"sunrise-sunset API 返回异常: {sun_data.get('status')}")
+
+            results = sun_data['results']
+            # API 返回 ISO8601 UTC 时间字符串，如 "2025-06-01T22:13:00+00:00"
+            sunrise_utc = datetime.fromisoformat(results['sunrise'])
+            sunset_utc = datetime.fromisoformat(results['sunset'])
+
+            # 转换为本地时间
+            sunrise_local = sunrise_utc.astimezone().replace(tzinfo=None)
+            sunset_local = sunset_utc.astimezone().replace(tzinfo=None)
+
+            self._sunrise_time = sunrise_local.time()
+            self._sunset_time = sunset_local.time()
+            self._sun_info_date = today
+
+            self.window.append_log(
+                f"日出: {self._sunrise_time.strftime('%H:%M:%S')}  "
+                f"日落: {self._sunset_time.strftime('%H:%M:%S')}（本地时间）",
+                'info'
+            )
+            return True
+
+        except Exception as e:
+            self.window.append_log(f"日出日落查询失败: {e}", 'error')
+            return False
+
+    def _is_daytime(self) -> bool:
+        """判断当前本地时间是否处于白天（日出到日落之间）"""
+        now_t = datetime.now().time()
+        return self._sunrise_time <= now_t < self._sunset_time
+
+    def check_auto_mode(self):
+        """定时检查并自动下发昼夜模式指令"""
+        if not self.auto_mode_enabled:
+            return
+        if not self.serial_mgr.is_connected():
+            return
+
+        # 如果缓存过期（新的一天）则重新获取日出日落
+        today = datetime.now().date()
+        if self._sun_info_date != today:
+            if not self._fetch_sun_times():
+                self.window.auto_mode_status.setText("状态: 日出日落查询失败")
+                self.window.auto_mode_status.setStyleSheet("color: red;")
+                return
+
+        day = self._is_daytime()
+        new_mode = 'DAY' if day else 'NIGHT'
+
+        # 仅在模式发生变化时下发指令，避免重复发送
+        if new_mode != self.current_mode:
+            self.window.append_log(
+                f"自动昼夜: {self.current_mode} → {new_mode}", 'info'
+            )
+            self.on_set_mode(day)
+
+        # 刷新状态标签
+        sr = self._sunrise_time.strftime('%H:%M') if self._sunrise_time else '--:--'
+        ss = self._sunset_time.strftime('%H:%M') if self._sunset_time else '--:--'
+        self.window.auto_mode_status.setText(
+            f"状态: {'白天' if day else '夜晚'}  日出{sr} 日落{ss}"
+        )
+        self.window.auto_mode_status.setStyleSheet(
+            "color: #FF9800;" if day else "color: #5C6BC0;"
+        )
+
+    def on_toggle_auto_mode(self):
+        """切换自动昼夜模式开关"""
+        self.auto_mode_enabled = self.window.auto_mode_btn.isChecked()
+
+        if self.auto_mode_enabled:
+            self.window.auto_mode_btn.setStyleSheet(
+                "background-color: #6A1B9A; border: 2px solid #CE93D8;"
+            )
+            self.window.append_log("自动昼夜模式已启用", 'info')
+
+            # 立即查询日出日落并执行一次检查
+            self.window.auto_mode_status.setText("状态: 正在查询日出日落...")
+            self.window.auto_mode_status.setStyleSheet("color: gray;")
+
+            if self._fetch_sun_times():
+                self.check_auto_mode()
+            else:
+                self.window.auto_mode_status.setText("状态: 查询失败，将在下次重试")
+                self.window.auto_mode_status.setStyleSheet("color: red;")
+
+            self.auto_mode_timer.start(60_000)  # 每60秒检查一次
+        else:
+            self.auto_mode_timer.stop()
+            self.window.auto_mode_btn.setStyleSheet("background-color: #9C27B0;")
+            self.window.auto_mode_status.setText("状态: 未启用")
+            self.window.auto_mode_status.setStyleSheet("color: gray;")
+            self.window.append_log("自动昼夜模式已关闭", 'info')
     
     # === 其他功能 ===
     
