@@ -67,6 +67,8 @@ class ClockSystemApp:
         self.window.set_time_btn.clicked.connect(self.on_set_time)
         self.window.set_alarm_btn.clicked.connect(self.on_set_alarm)
         self.window.alarm_off_btn.clicked.connect(self.on_alarm_off)
+        self.window.set_timer_btn.clicked.connect(self.on_set_timer)
+        self.window.timer_off_btn.clicked.connect(self.on_timer_off)
         
         self.window.display_on_btn.clicked.connect(lambda: self.on_set_display(True))
         self.window.display_off_btn.clicked.connect(lambda: self.on_set_display(False))
@@ -233,11 +235,15 @@ class ClockSystemApp:
         
         event_type, event_data = ProtocolParser.parse_event(event_str)
         
-        if event_type == 'KEY':
+        if event_type == 'INIT':
+            # 设备初始化事件：重置所有状态为初始值
+            self._reset_all_states()
+            self.window.append_log("设备初始化，所有状态已重置", 'info')
+            
+        elif event_type == 'KEY':
             # 按键事件
             key_name = event_data
             self.window.append_log(f"按键按下: {key_name}", 'event')
-            
         elif event_type == 'DISP':
             # 显示变化事件
             disp_str, dp_hex = ProtocolParser.parse_disp_event(event_data)
@@ -249,7 +255,6 @@ class ClockSystemApp:
             # LED变化事件
             led_byte = ProtocolParser.parse_led_event(event_data)
             self.twin_panel.update_leds(led_byte)
-            
         elif event_type == 'ALARM':
             # 闹钟响铃
             self.alarm_enabled = True
@@ -258,7 +263,6 @@ class ClockSystemApp:
         elif event_type == 'ALARM_OFF':
             # 闹钟停止
             self.window.update_status_bar(alarm_val='已停止')
-            
         elif event_type == 'EDIT':
             # 本地编辑事件
             self.window.append_log(f"本地编辑: {event_data}", 'event')
@@ -269,6 +273,50 @@ class ClockSystemApp:
             self.window.update_status_bar(mode_val=event_data)
             self.twin_panel.set_night_mode(event_data == 'NIGHT')
     
+    def _reset_all_states(self):
+        """重置所有状态为初始值"""
+        # 显示方向
+        self.current_format = 'LEFT'
+        self.window.update_status_bar(format_val='LEFT')
+
+        # 显示模式
+        self.current_mode = 'DAY'
+        self.window.update_status_bar(mode_val='DAY')
+        self.twin_panel.set_night_mode(False)
+
+        # 显示开关
+        self.display_on = True
+        self.twin_panel.set_display_on(True)
+
+        # 闹钟状态
+        self.alarm_enabled = False
+        self.window.update_status_bar(alarm_val='未知')
+
+        # 自动昼夜模式
+        self.auto_mode_enabled = False
+        self.auto_mode_timer.stop()
+        self.window.auto_mode_btn.setChecked(False)
+        self.window.auto_mode_btn.setStyleSheet("background-color: #9C27B0;")
+        self.window.auto_mode_status.setText("状态: 未启用")
+        self.window.auto_mode_status.setStyleSheet("color: gray;")
+
+        # 日出日落缓存
+        self._sunrise_time = None
+        self._sunset_time = None
+        self._sun_info_date = None
+
+        # NTP对时状态
+        self.window.ntp_status.setText("状态: 未对时")
+        self.window.ntp_status.setStyleSheet("color: gray;")
+
+        # 天气状态
+        self.window.weather_status.setText("状态: 未获取")
+        self.window.weather_status.setStyleSheet("color: gray;")
+
+        # 延迟和运行时间
+        self.window.latency_label.setText("-- ms")
+        self.window.uptime_label.setText("-- s")
+        
     def on_connection_lost(self):
         """连接丢失处理"""
         self.disconnect()
@@ -314,6 +362,19 @@ class ClockSystemApp:
         self.send_command(cmd)
         self.alarm_enabled = False
         self.window.update_status_bar(alarm_val='已关闭')
+
+    def on_set_timer(self):
+        """设置倒计时"""
+        hour = self.window.timer_hour_spin.value()
+        minute = self.window.timer_minute_spin.value()
+        second = self.window.timer_second_spin.value()
+        cmd = CommandBuilder.set_timer(hour, minute, second)
+        self.send_command(cmd)
+
+    def on_timer_off(self):
+        """关闭倒计时"""
+        cmd = CommandBuilder.set_timer(off=True)
+        self.send_command(cmd)
     
     def on_set_display(self, on: bool):
         """设置显示开关"""

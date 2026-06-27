@@ -701,6 +701,7 @@ void cmd_RST(void){
 	systick_count = 0;
 
     respond_ok();
+	respond("*EVT:INIT");
 }
 
 // ---- *SET 实现 ----
@@ -2468,7 +2469,7 @@ void countdown_update(void){
 		if (elapsed_ms >= countdown_total_ms) {
 			/* 倒计时归零 */
 			show_countdown(0);
-						countdown_state = COUNTDOWN_EXPIRED;
+			countdown_state = COUNTDOWN_EXPIRED;
 			countdown_expire_tick = systick_count;
 			countdown_alarm_tick = 0xFF;
 		} else {
@@ -2510,11 +2511,11 @@ void countdown_expire_alarm(void){
 			countdown_alarm_tick = cur_sec;
 			Buzzer_Toggle();
 			led_bitmap ^= (1<<1);
-			/* 奇数秒显示，偶数秒清屏 —— 实现闪烁 */
+
 			if (cur_sec & 1) {
-				show_countdown(0);
-			} else {
 				seg_clear();
+			} else {
+				set_seg_disp("TIME UP", 0x00);
 			}
 		}
 	}
@@ -2535,7 +2536,7 @@ int main(void){
 	S800_UART_Init();
 	S800_Int_Init();
 	
-	UARTStringPutNonBlocking("Initialization complete.\r\n");
+	respond("*EVT:INIT");
 	/* ============ MAIN LOOP ================ */
 	for(;;)
 	{	
@@ -2633,7 +2634,7 @@ int main(void){
 				add_cur_subitem();
 			}
 
-						/* UART 活动指示：LED 第4位 100ms 闪烁（NIGHT模式不亮） */
+			/* UART 活动指示：LED 第4位 100ms 闪烁（NIGHT模式不亮） */
 			if(system_mode != MODE_BOOT && system_light == MODE_DAY){
 				if(uart_active){
 					if(systick_count - uart_last_active_tick >= UART_ACTIVE_TIMEOUT){
@@ -2659,25 +2660,25 @@ int main(void){
 					led_bitmap ^= 0x01;
 				
 					/* 天气相关 LED 控制 */
-					if (weather_info.active) {
-						// LED4 (bit3): SUN 时常亮
+					if (weather_info.active == 1) {
+						// LED4: SUN 时常亮
 						if (strcmp(weather_info.condition, "SUN") == 0) {
-							led_bitmap |= (1<<3);
+							led_bitmap |= (uint8_t)(1<<4);
 						}else{
-							led_bitmap &= ~(1<<3);
+							led_bitmap &= (uint8_t)(~(1<<4));
 						}
-						// LED5 (bit4): RAI/SNO 时 1Hz 呼吸(500ms翻转)
+						// LED5: RAI/SNO 时 1Hz 呼吸(500ms翻转)
 						if (strcmp(weather_info.condition, "RAI") == 0 || 
 							strcmp(weather_info.condition, "SNO") == 0) {
-							led_bitmap ^= (1<<4);
+							led_bitmap ^= (uint8_t)(1<<5);
 						}else{
-							led_bitmap &= (1<<4);
+							led_bitmap &= (uint8_t)(~(1<<5));
 						}
-						// LED6 (bit5): ≥30*C 时常亮
+						// LED6: ≥30*C 时常亮
 						if (weather_info.temperature >= 30) {
-							led_bitmap |= (1<<5);
+							led_bitmap |= (uint8_t)(1<<6);
 						}else{
-							led_bitmap &= (1<<5);
+							led_bitmap &= (uint8_t)(~(1<<6));
 						}
 					}
 				}
